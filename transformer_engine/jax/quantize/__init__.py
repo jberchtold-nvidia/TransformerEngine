@@ -18,3 +18,4 @@ from .hadamard import *
 from .helper import *
 from .device_utils import *
 from .misc import *
+from .cache import *

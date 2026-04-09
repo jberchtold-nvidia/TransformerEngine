@@ -846,11 +846,16 @@ class QuantizerSet:
         x: Quantizer for input tensors
         kernel: Quantizer for kernel tensors
         dgrad: Quantizer for gradient tensors
+        cached_kernel: Optional pre-quantized kernel to bypass quantization in the
+            forward pass. When set, ``_dense_fwd_rule`` uses this tensor directly
+            instead of calling ``tex.quantize`` on the kernel. Used for caching
+            quantized weights across gradient-accumulation micro-steps.
     """
 
     x: Optional[Quantizer]
     kernel: Optional[Quantizer]
     dgrad: Optional[Quantizer]
+    cached_kernel: Optional[ScaledTensor] = None
 
     def tree_flatten(self):
         """Flatten the quantizer set for JAX tree operations.
@@ -858,7 +863,7 @@ class QuantizerSet:
         Returns:
             Tuple of (children, aux_data) for tree operations
         """
-        children = (self.x, self.kernel, self.dgrad)
+        children = (self.x, self.kernel, self.dgrad, self.cached_kernel)
         aux_data = ()
         return (children, aux_data)
 

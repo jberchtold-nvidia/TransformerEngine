@@ -1408,7 +1408,7 @@ def wrap_function_in_te_state_module(
     return TEWrapper
 
 
-def make_dot_general_cls(quantization_recipe):
+def make_dot_general_cls(quantization_recipe, cache_quantized_weights=False):
     """Creates a Flax module class that performs a dot_general operation with the arguments x and kernel using the given quantization recipe.
 
     This is intended for usage when you already have model parameters initialized and sharded for the kernel weights and you want to replace the GEMM implementation with TE's quantized GEMM using a given recipe.
@@ -1421,14 +1421,21 @@ def make_dot_general_cls(quantization_recipe):
 
     If you would like a drop-in replacement for nn.Dense that manages the model weights itself, please use TE's DenseGeneral module.
 
+    When ``cache_quantized_weights=True``, the returned module caches
+    quantized kernels in the ``quantized_kernel_cache`` Flax variable
+    collection so they can be reused across gradient-accumulation
+    micro-steps.  Control caching via
+    :func:`transformer_engine.jax.quantize.cache.set_quantized_cache_validity`.
+
     Args:
         quantization_recipe: The quantization recipe to use for the dot_general operation.
+        cache_quantized_weights: If ``True``, return a ``CachingTEWrapper``
+            that caches quantized kernels across micro-steps.
     Returns:
         A Flax module class that performs a dot_general operation with the given quantization recipe.
     """
     import transformer_engine.jax as te
     from transformer_engine.common.recipe import NVFP4BlockScaling
-
     def te_dot_general(generate_quantizer_set, x, kernel, dims, **kwargs):
         """Performs a dot_general operation using TransformerEngine with quantization."""
         del kwargs  # Unused
@@ -1449,7 +1456,67 @@ def make_dot_general_cls(quantization_recipe):
             quantizer_set=quantizer_set,
         )
 
-    return wrap_function_in_te_state_module(te_dot_general, quantization_recipe, "dot_general")
+    BaseTEWrapper = wrap_function_in_te_state_module(
+        te_dot_general, quantization_recipe, "dot_general"
+    )
+
+    if not cache_quantized_weights:
+        return BaseTEWrapper
+
+    class CachingTEWrapper(BaseTEWrapper):
+        """TEWrapper subclass that caches quantized kernels across GA micro-steps.
+
+        Uses Python-level branching (two JIT traces) rather than
+        ``jax.lax.cond``, because ``tex.quantize`` contains primitives
+        without VJP rules.
+
+        * When ``quantized_kernel_cache`` is **not** in the input
+          variables → "fresh" trace: quantizes and populates the cache.
+        * When ``quantized_kernel_cache`` **is** in the input variables
+          → "cached" trace: loads from cache (skips quantization).
+        """
+
+        @nn.compact
+        def __call__(self, x, kernel, dims, **kwargs):
+            del kwargs  # Unused
+            contracting_dims, batch_dims = dims
+            assert batch_dims == ((), ()), (
+                "Batch dimensions must be empty for TransformerEngine dot."
+            )
+
+            quantizer_set = self.generate_quantizer_set()
+
+            if isinstance(quantization_recipe, NVFP4BlockScaling):
+                x = x.astype(jnp.bfloat16)
+                kernel = kernel.astype(jnp.bfloat16)
+
+            from ..quantize.cache import (  # pylint: disable=import-outside-toplevel
+                QW_CACHE_COLLECTION,
+                quantize_and_cache_kernel,
+                load_cached_kernel,
+            )
+
+            # Python-level check → two separate JIT traces.
+            has_cache = self.has_variable(QW_CACHE_COLLECTION, "leaf_0")
+            if has_cache:
+                quantizer_set = load_cached_kernel(
+                    self, quantizer_set, kernel, contracting_dims
+                )
+            else:
+                quantizer_set = quantize_and_cache_kernel(
+                    self, quantizer_set, kernel, contracting_dims
+                )
+
+            return te.dense.dense(
+                x,
+                kernel,
+                contracting_dims=contracting_dims,
+                quantizer_set=quantizer_set,
+            )
+
+    CachingTEWrapper.__name__ = "CachingTEWrapper_dot_general"
+
+    return CachingTEWrapper
 
 
 def make_grouped_dense_cls(quantization_recipe, quantization_checkpoint_name: Optional[str] = None):

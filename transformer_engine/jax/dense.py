@@ -204,12 +204,15 @@ def _dense_fwd_rule(
     )
     casted_x = with_sharding_constraint_by_logical_axes(casted_x, input_axes)
 
-    casted_kernel = tex.quantize(
-        kernel,
-        flatten_axis=flatten_axis_k,
-        quantizer=quantizer_set.kernel,
-        amax_scope=AmaxScope.FSDP,
-    )
+    if quantizer_set.cached_kernel is not None:
+        casted_kernel = quantizer_set.cached_kernel
+    else:
+        casted_kernel = tex.quantize(
+            kernel,
+            flatten_axis=flatten_axis_k,
+            quantizer=quantizer_set.kernel,
+            amax_scope=AmaxScope.FSDP,
+        )
     casted_kernel = with_sharding_constraint_by_logical_axes(casted_kernel, kernel_axes)
 
     # GEMM NN
@@ -224,12 +227,22 @@ def _dense_fwd_rule(
     output = with_sharding_constraint_by_logical_axes(output, output_axes)
 
     has_bias = bias is not None
+    # Strip cached_kernel from the quantizer_set stored in residuals —
+    # _dense_bwd_rule only needs .dgrad (and returns the set for state
+    # propagation).  Keeping a ScaledTensor in residuals breaks lax.scan
+    # abstract evaluation because ScaledTensor.__post_init__ validates
+    # .data.shape which is unavailable on abstract placeholders.
+    ctx_quantizer_set = QuantizerSet(
+        x=quantizer_set.x,
+        kernel=quantizer_set.kernel,
+        dgrad=quantizer_set.dgrad,
+    )
     ctx = (
         casted_x.get_tensor(usage=TensorUsage.LHS_TRANS).checkpoint(quantizer_set.x),
         casted_kernel.get_tensor(usage=TensorUsage.RHS_TRANS).checkpoint(quantizer_set.kernel),
         x.shape,
         kernel.shape,
-        quantizer_set,
+        ctx_quantizer_set,
         flatten_axis_k,
         has_bias,
     )
