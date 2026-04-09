@@ -1519,8 +1519,17 @@ def make_dot_general_cls(quantization_recipe, cache_quantized_weights=False):
     return CachingTEWrapper
 
 
-def make_grouped_dense_cls(quantization_recipe, quantization_checkpoint_name: Optional[str] = None):
-    """Creates a grouped dense (grouped GEMM) instance for use with TE state module."""
+def make_grouped_dense_cls(
+    quantization_recipe,
+    quantization_checkpoint_name: Optional[str] = None,
+    cache_quantized_weights: bool = False,
+):
+    """Creates a grouped dense (grouped GEMM) instance for use with TE state module.
+
+    When ``cache_quantized_weights=True``, returns a caching variant that
+    stores quantized kernels in the ``quantized_kernel_cache`` Flax variable
+    collection for reuse across gradient-accumulation micro-steps.
+    """
     if quantization_recipe is not None:
         allowed_grouped_gemm_recipes = [MXFP8BlockScaling]
         assert any(isinstance(quantization_recipe, r) for r in allowed_grouped_gemm_recipes), (
@@ -1543,9 +1552,50 @@ def make_grouped_dense_cls(quantization_recipe, quantization_checkpoint_name: Op
         )
         return out
 
-    return wrap_function_in_te_state_module(
+    BaseTEWrapper = wrap_function_in_te_state_module(
         te_grouped_dot_general,
         quantization_recipe,
         "ragged_dot",
         quantization_checkpoint_name=quantization_checkpoint_name,
-    )()
+    )
+
+    if not cache_quantized_weights:
+        return BaseTEWrapper()
+
+    class CachingGroupedTEWrapper(BaseTEWrapper):
+        """TEWrapper for grouped GEMM with quantized-weight caching."""
+
+        @nn.compact
+        def __call__(self, x, kernel, group_sizes, **kwargs):
+            del kwargs
+            from ..quantize.cache import (  # pylint: disable=import-outside-toplevel
+                QW_CACHE_COLLECTION,
+                grouped_quantize_and_cache_kernel,
+                grouped_load_cached_kernel,
+            )
+
+            num_groups = group_sizes.shape[0]
+            quantizer_set = self.generate_quantizer_set(n_groups=num_groups)
+
+            has_cache = self.has_variable(QW_CACHE_COLLECTION, "leaf_0")
+            contracting_dims = ((1,), (1,))
+            if has_cache:
+                quantizer_set = grouped_load_cached_kernel(
+                    self, quantizer_set, kernel, group_sizes, contracting_dims,
+                )
+            else:
+                quantizer_set = grouped_quantize_and_cache_kernel(
+                    self, quantizer_set, kernel, group_sizes, contracting_dims,
+                )
+
+            return grouped_dense(
+                x,
+                kernel,
+                group_sizes=group_sizes,
+                contracting_dims=contracting_dims,
+                quantizer_set=quantizer_set,
+            )
+
+    CachingGroupedTEWrapper.__name__ = "CachingTEWrapper_ragged_dot"
+
+    return CachingGroupedTEWrapper()
