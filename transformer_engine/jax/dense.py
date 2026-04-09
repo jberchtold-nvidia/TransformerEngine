@@ -435,10 +435,7 @@ def _grouped_dense_fwd_rule(
         flatten_axis=flatten_axis_x,
     )
 
-    if quantizer_set.cached_kernel is not None:
-        casted_kernel = quantizer_set.cached_kernel
-    else:
-        casted_kernel = tex.grouped_quantize(kernel, quantizer_set.kernel, flatten_axis=flatten_axis_k)
+    casted_kernel = tex.grouped_quantize(kernel, quantizer_set.kernel, flatten_axis=flatten_axis_k)
     contracting_dims = (x_contracting_dims, k_contracting_dims)
 
     # For x_contracting_dims == (1,) and k_contracting_dims == (1,), we should have
@@ -459,14 +456,6 @@ def _grouped_dense_fwd_rule(
         group_offset=group_offset,
     )
 
-    # Strip cached_kernel from quantizer_set stored in residuals — the
-    # backward only needs .dgrad.  Keeping a ScaledTensor / GroupedScaledTensor
-    # in residuals breaks lax.scan abstract evaluation.
-    ctx_quantizer_set = QuantizerSet(
-        x=quantizer_set.x,
-        kernel=quantizer_set.kernel,
-        dgrad=quantizer_set.dgrad,
-    )
     ctx = (
         group_sizes,
         ctx_x.checkpoint(quantizer_set.x) if isinstance(ctx_x, ScaledTensor) else ctx_x,
@@ -478,7 +467,7 @@ def _grouped_dense_fwd_rule(
         x.shape,
         kernel.shape,
         use_bias,
-        ctx_quantizer_set,
+        quantizer_set,
         flatten_axis_k,
     )
     return output, ctx
