@@ -71,12 +71,13 @@ def _get_cache_variable_specs(
             fa = len(kernel_shape) - flatten_axis
         scale_shape = scaling_mode.get_scale_shape(
             kernel_shape, data_layout=layout_char,
-            is_colwise=is_colwise, is_padded=True, flatten_axis=fa,
+            is_colwise=is_colwise, is_padded=False, flatten_axis=fa,
         )
+        scale_dtype = scaling_mode.get_scale_dtype()
         return [
             jax.ShapeDtypeStruct(kernel_shape, q_dtype),
             jax.ShapeDtypeStruct((1,), jnp.float32),
-            jax.ShapeDtypeStruct(scale_shape, jnp.float32),
+            jax.ShapeDtypeStruct(scale_shape, scale_dtype),
         ]
 
     if q_layout.is_rowwise_colwise:
