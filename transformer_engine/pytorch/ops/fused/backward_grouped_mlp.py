@@ -33,7 +33,6 @@ from .._common import (
 )
 from ...cpp_extensions import (
     general_gemm,
-    general_grouped_gemm,
     general_grouped_gemm_for_grouped_tensor,
 )
 from ...module.base import _2X_ACC_WGRAD
@@ -1064,16 +1063,45 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                         layout="NN",
                     )
                 else:
-                    fc1_dy_tensors = grouped_fc1_dy.split_into_quantized_tensors()
-                    general_grouped_gemm(
-                        grouped_fc1_weight,
-                        fc1_dy_tensors,
-                        [grad_input],
-                        [None] * num_groups,
-                        dtype,
+                    if isinstance(grouped_fc1_weight, GroupedTensor):
+                        fc1_weight_for_dgrad = grouped_fc1_weight
+                    else:
+                        fc1_weight_for_dgrad = GroupedTensor(
+                            shape=(num_groups * fc1_weight_shape[0], fc1_weight_shape[1]),
+                            dtype=dtype,
+                            num_tensors=num_groups,
+                            quantizer=fc1_ctx.weight_quantizer,
+                            columnwise_data=torch.cat(
+                                [w._columnwise_data.reshape(-1) for w in grouped_fc1_weight],
+                                dim=0,
+                            ),
+                            columnwise_scale_inv=torch.cat(
+                                [
+                                    w._columnwise_scale_inv.reshape(-1)
+                                    for w in grouped_fc1_weight
+                                ],
+                                dim=0,
+                            ),
+                            columnwise_amax=torch.cat(
+                                [w._amax_columnwise.reshape(-1) for w in grouped_fc1_weight],
+                                dim=0,
+                            ),
+                            with_gemm_swizzled_scales=True,
+                        )
+                    grouped_grad_input = GroupedTensor(
+                        shape=(out_shape[0], fc1_weight_shape[1]),
+                        dtype=dtype,
+                        num_tensors=num_groups,
+                        quantizer=None,
+                        data=grad_input.view(-1),
+                        first_dims=split_sizes,
+                        tensor_offsets=fc1_x_tensor_offsets,
+                    )
+                    general_grouped_gemm_for_grouped_tensor(
+                        fc1_weight_for_dgrad,
+                        grouped_fc1_dy,
+                        grouped_grad_input,
                         layout="NN",
-                        m_splits=split_sizes.detach().cpu().tolist(),
-                        single_output=True,
                     )
             else:
                 fc1_dgrad_a_data = fc2_dgrad_kernel_out["d_row_tensor"]
