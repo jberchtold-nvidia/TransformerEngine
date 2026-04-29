@@ -434,7 +434,9 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             )
 
         # NVFP4 vs MXFP8 data layout constants
-        use_nvfp4 = isinstance(fc1_input_quantizer, NVFP4Quantizer)
+        use_nvfp4 = isinstance(fc1_input_quantizer, NVFP4Quantizer) or (
+            type(fc1_weight_param).__name__ == "NVFP4Tensor"
+        )
         data_dtype = torch.float4_e2m1fn_x2 if use_nvfp4 else torch.float8_e4m3fn
         scale_view_dtype = torch.float8_e4m3fn if use_nvfp4 else torch.float8_e8m0fnu
         sf_vec_size = NVFP4_BLOCK_SCALING_SIZE if use_nvfp4 else MXFP8_BLOCK_SCALING_SIZE
@@ -659,7 +661,11 @@ class ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8(FusedOperation):
             # Bias / bias scaling are applied as a separate elementwise op below
             # to avoid the cuDNN-specific packed bias layout.
             fc2_out_buf = torch.empty(fc2_out_shape, dtype=dtype, device=device)
-            if num_groups == 1:
+            if (
+                num_groups == 1
+                and grouped_fc2_x.columnwise_data is not None
+                and grouped_fc2_x.columnwise_scale_inv is not None
+            ):
                 if fc2_op.single_grouped_weight:
                     fc2_w_single = grouped_fc2_weight.split_into_quantized_tensors()[0]
                 else:

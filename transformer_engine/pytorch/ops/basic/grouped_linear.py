@@ -741,9 +741,8 @@ class GroupedLinear(BasicOperation):
 
         # Extract split sizes from extra input
         split_sizes = basic_op_extra_inputs[0][0]
-        split_sizes_int = [int(s) for s in split_sizes.tolist()]
-        if len(split_sizes_int) != num_groups:
-            raise ValueError(f"Expected {num_groups} splits, but got {len(split_sizes_int)}.")
+        if split_sizes.numel() != num_groups:
+            raise ValueError(f"Expected {num_groups} splits, but got {int(split_sizes.numel())}.")
 
         # Extract scales tensor for bias scaling
         scales = None
@@ -782,6 +781,11 @@ class GroupedLinear(BasicOperation):
 
         # Split input tensor and convert dtypes if needed
         x = maybe_dequantize(input_, dtype)
+        if num_groups == 1:
+            # Avoid CUDA->CPU sync from split_sizes.tolist() during CUDA graph capture.
+            split_sizes_int = [x.numel() // x.size(-1)]
+        else:
+            split_sizes_int = [int(s) for s in split_sizes.tolist()]
         xs = None
         if with_quantized_compute:
             for quantizer in input_quantizers:
@@ -881,8 +885,12 @@ class GroupedLinear(BasicOperation):
         ws, saved_tensors = saved_tensors[:num_groups], saved_tensors[num_groups:]
 
         # Split grad output tensor and convert dtypes if needed
-        split_sizes_int = [int(s) for s in split_sizes.tolist()]
         dy = maybe_dequantize(grad_output, ctx.dtype)
+        if num_groups == 1:
+            # Avoid CUDA->CPU sync from split_sizes.tolist() during CUDA graph capture.
+            split_sizes_int = [dy.numel() // dy.size(-1)]
+        else:
+            split_sizes_int = [int(s) for s in split_sizes.tolist()]
         dys = None
         grad_biases = [None] * num_groups
         grad_scales = None

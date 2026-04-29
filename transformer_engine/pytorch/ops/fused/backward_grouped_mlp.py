@@ -605,6 +605,7 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
         out_shape = list(grad_output.size())
         num_groups = fc1_op.num_groups
         fc1_weight_param = fc1_op.weight if fc1_op.single_grouped_weight else fc1_op.weight0
+        fc2_weight_param = fc2_op.weight if fc2_op.single_grouped_weight else fc2_op.weight0
         device = fc1_weight_param.device
         dtype = fc1_ctx.dtype
 
@@ -738,7 +739,11 @@ class BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8(FusedOperation):
                 )
 
         # NVFP4 vs MXFP8 data layout constants
-        use_nvfp4 = isinstance(fc2_grad_output_quantizer, NVFP4Quantizer)
+        use_nvfp4 = (
+            isinstance(fc2_grad_output_quantizer, NVFP4Quantizer)
+            or type(fc1_weight_param).__name__ == "NVFP4Tensor"
+            or type(fc2_weight_param).__name__ == "NVFP4Tensor"
+        )
         data_dtype = torch.float4_e2m1fn_x2 if use_nvfp4 else torch.float8_e4m3fn
         scale_view_dtype = torch.float8_e4m3fn if use_nvfp4 else torch.float8_e8m0fnu
         sf_vec_size = NVFP4_BLOCK_SCALING_SIZE if use_nvfp4 else MXFP8_BLOCK_SCALING_SIZE
