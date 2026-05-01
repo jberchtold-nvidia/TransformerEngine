@@ -1555,12 +1555,15 @@ void nvte_grouped_gemm_with_discrete_inputA(const NVTETensor *A_list, size_t num
   } else {
     NVTE_CHECK(A_list_info.all_col, "Grouped GEMM: A_list is missing column-wise data");
     A_sel.dtype = A_list_info.col_dtype;
-    // NVFP4/MXFP8 columnwise data is physically transposed (logical shape == rowwise shape);
-    // pass swap_dims so rows/cols and avg_first/last match the physical layout cuBLAS sees.
+    // GroupedTensor metadata stores the original logical shape, so columnwise storage needs
+    // swap_dims. Discrete NVFP4 A tensors with logical transa=false expose columnwise data with
+    // the transposed logical shape already, so swapping here would undo the layout needed by cuBLAS.
+    const bool nvfp4_discrete_a_columnwise = nvfp4 && !static_cast<bool>(transa);
+    const bool swap_dims = nvfp4_discrete_a_columnwise ? false : choice.swap_dims;
     a_multi_tensor_args = build_grouped_gemm_multi_inputA_args(
         A_list, num_a_tensors, /*use_rowwise=*/false, is_fp8, &avg_first_dim, &avg_last_dim, "A",
         /*needs_scale_inv=*/nvfp4 || fp8_block,
-        /*swap_dims=*/choice.swap_dims);
+        /*swap_dims=*/swap_dims);
   }
 
   // For discrete A_list, scale pointers are per-tensor; use multi-tensor args.
