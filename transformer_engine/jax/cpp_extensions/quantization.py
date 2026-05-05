@@ -1340,7 +1340,9 @@ def _grouped_quantize_nvfp4(
         raise ValueError(
             "Grouped NVFP4 quantize requires the V2 graph-safe path; the input shape or"
             " device capability does not satisfy the V2 prerequisites (SM100+, 128-aligned"
-            f" dims).  Got x.shape={x.shape}, flatten_axis={flatten_axis}."
+            f" dims).  Got x.shape={x.shape}, flatten_axis={flatten_axis}.  No V1"
+            " fallback exists for NVFP4 (the V1 multi-tensor quantize would not produce"
+            " pre-swizzled scales that the V2 grouped GEMM requires)."
         )
 
     if x.dtype != jnp.bfloat16:
