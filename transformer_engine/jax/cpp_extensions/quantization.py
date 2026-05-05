@@ -3,7 +3,8 @@
 # See LICENSE for license information.
 """JAX/TE custom ops for quantization"""
 import operator
-from functools import reduce
+import os
+from functools import cache, reduce
 from typing import Tuple, Optional, Union
 import math
 
@@ -990,6 +991,25 @@ def quantize_dbias(
     )
 
 
+@cache
+def _should_enforce_v2_grouped_quantize() -> bool:
+    """Read ``NVTE_JAX_ENFORCE_V2_GROUPED_QUANTIZE`` once per process (cached).
+
+    Mirrors ``_should_enforce_v2_grouped_gemm`` in cpp_extensions/gemm.py.  When set,
+    callers that would otherwise silently fall back to V1 grouped quantize raise a
+    RuntimeError instead — useful for verifying that the V2 kernel is actually being
+    used in a given workload.
+    """
+    val = os.getenv("NVTE_JAX_ENFORCE_V2_GROUPED_QUANTIZE", "0")
+    try:
+        return bool(int(val))
+    except ValueError as e:
+        raise ValueError(
+            "NVTE_JAX_ENFORCE_V2_GROUPED_QUANTIZE must be an integer (0 or 1), got:"
+            f" {val!r}"
+        ) from e
+
+
 class GroupedQuantizePrimitive(BasePrimitive):
     """
     Cast Primitive wrapping nvte_quantize and nvte_quantize_dbias.
@@ -1025,8 +1045,8 @@ class GroupedQuantizePrimitive(BasePrimitive):
     outer_primitive = None
 
     @staticmethod
-    def _use_v2_kernel(scaling_mode, x_shape, flatten_axis):
-        """Return True when a V2 (CUDA-graph-safe) grouped quantize kernel can be used.
+    def _is_v2_supported(scaling_mode, x_shape, flatten_axis) -> Tuple[bool, str]:
+        """Return ``(supported, reason)`` for whether the V2 grouped quantize can be used.
 
         Two V2 paths are supported:
 
@@ -1045,26 +1065,80 @@ class GroupedQuantizePrimitive(BasePrimitive):
         """
         sm = ScalingMode(scaling_mode)
         if sm not in (ScalingMode.MXFP8_1D_SCALING, ScalingMode.NVFP4_1D_SCALING):
-            return False
-        # Require SM100+ for both MXFP8 (fused swizzle) and NVFP4 (graph-safe RHT path).
+            return (
+                False,
+                (
+                    "V2 grouped quantize only supports MXFP8_1D_SCALING and"
+                    f" NVFP4_1D_SCALING, but scaling_mode={sm}."
+                ),
+            )
         if get_min_device_compute_capability() < 100:
-            return False
+            return (
+                False,
+                (
+                    "V2 grouped quantize requires SM100+ (Blackwell or newer) but the"
+                    f" current min device compute capability is"
+                    f" {get_min_device_compute_capability()}."
+                ),
+            )
         ndim = len(x_shape)
         eff = flatten_axis if flatten_axis >= 0 else flatten_axis + ndim
         total_first_dim = math.prod(x_shape[:eff])
         if total_first_dim % 128 != 0:
-            return False
+            return (
+                False,
+                (
+                    "V2 grouped quantize requires the total first logical dim (product of"
+                    f" x.shape[:flatten_axis]) to be divisible by 128, but got"
+                    f" {total_first_dim} for x.shape={x_shape},"
+                    f" flatten_axis={flatten_axis}."
+                ),
+            )
         # For multi-dim group tensors (e.g., kernel shape G×K×N with eff=2),
         # non_group_m = K must also be 128-aligned.
         if eff > 1:
             non_group_m = math.prod(x_shape[1:eff])
             if non_group_m % 128 != 0:
-                return False
+                return (
+                    False,
+                    (
+                        "V2 grouped quantize requires the per-group row count"
+                        f" non_group_m=prod(x.shape[1:flatten_axis])={non_group_m} to be"
+                        f" divisible by 128, for x.shape={x_shape},"
+                        f" flatten_axis={flatten_axis}."
+                    ),
+                )
         # Last dim must be 128-aligned to match the V2 grouped GEMM requirement.
         last_dim = math.prod(x_shape[eff:])
         if last_dim % 128 != 0:
-            return False
-        return True
+            return (
+                False,
+                (
+                    "V2 grouped quantize requires the last logical dim (product of"
+                    f" x.shape[flatten_axis:]) to be divisible by 128, but got"
+                    f" {last_dim} for x.shape={x_shape}, flatten_axis={flatten_axis}."
+                ),
+            )
+        return True, ""
+
+    @staticmethod
+    def _use_v2_kernel(scaling_mode, x_shape, flatten_axis) -> bool:
+        """Return True when the V2 (CUDA-graph-safe) grouped quantize kernel can be used.
+
+        When ``NVTE_JAX_ENFORCE_V2_GROUPED_QUANTIZE=1``, an unsupported configuration
+        raises ``RuntimeError`` instead of silently falling back to V1.  Mirrors
+        ``is_v2_grouped_gemm_supported`` in cpp_extensions/gemm.py.
+        """
+        is_v2_supported, reason = GroupedQuantizePrimitive._is_v2_supported(
+            scaling_mode, x_shape, flatten_axis
+        )
+        if _should_enforce_v2_grouped_quantize() and not is_v2_supported:
+            raise RuntimeError(
+                "The TE V2 grouped quantize is not supported for the given input"
+                " parameters, but NVTE_JAX_ENFORCE_V2_GROUPED_QUANTIZE is enabled."
+                f" Reason: {reason}"
+            )
+        return is_v2_supported
 
     @staticmethod
     def abstract(
