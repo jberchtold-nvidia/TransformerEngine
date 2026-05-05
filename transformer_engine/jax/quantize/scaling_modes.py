@@ -956,12 +956,49 @@ class ScalingMode(Enum):
             is_padded=is_padded,
             flatten_axis=flatten_axis,
         )
+
+        # For scaling modes whose colwise data is stored as the transposed tensor
+        # (e.g. NVFP4 with data_layout="NT"), the colwise scale corresponds to the
+        # transposed data shape — same convention as get_scale_shape_2x.  The rotation
+        # mirrors what ScaledTensorFactory.create_1x does when constructing the colwise
+        # GroupedScaledTensor1x:
+        # - if data_shape[0] == n_groups (kernel-style, group axis at position 0): keep
+        #   the group axis put and swap dims [1:flatten_axis] with dims [flatten_axis:]
+        # - else (lhs-style, ragged group dim subsumed): swap dims [:flatten_axis] with
+        #   dims [flatten_axis:]
+        # Match get_grouped_scale_shape's flatten_axis convention which it derives from
+        # the (possibly post-rotation) shape.
+        impl = self._get_impl()
+        data_layout = impl.get_data_layout() if hasattr(impl, "get_data_layout") else "NN"
+        colwise_layout = data_layout[1] if len(data_layout) >= 2 else "N"
+        colwise_data_shape = data_shape
+        colwise_flatten_axis = flatten_axis
+        if colwise_layout == "T":
+            ndim = len(data_shape)
+            eff_flatten_axis = flatten_axis if flatten_axis >= 0 else ndim + flatten_axis
+            assert 0 < eff_flatten_axis < ndim, (
+                f"flatten_axis {flatten_axis} is out of bounds for shape {data_shape}"
+            )
+            if data_shape[0] == n_groups:
+                # Group axis stays at position 0.
+                colwise_data_shape = (
+                    data_shape[0],
+                    *data_shape[eff_flatten_axis:],
+                    *data_shape[1:eff_flatten_axis],
+                )
+                colwise_flatten_axis = ndim - eff_flatten_axis + 1
+            else:
+                colwise_data_shape = (
+                    *data_shape[eff_flatten_axis:],
+                    *data_shape[:eff_flatten_axis],
+                )
+                colwise_flatten_axis = ndim - eff_flatten_axis
         colwise_scale_shape = self.get_grouped_scale_shape(
-            data_shape,
+            colwise_data_shape,
             n_groups,
             is_colwise=True,
             is_padded=is_padded,
-            flatten_axis=flatten_axis,
+            flatten_axis=colwise_flatten_axis,
         )
         return (rowwise_scale_shape, colwise_scale_shape)
 
