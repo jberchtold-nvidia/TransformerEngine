@@ -117,6 +117,44 @@ def transpose_dims(ndim, dims_to_transpose, flatten_axis=-1):
     return tuple(transposed_dims.index(dim) for dim in dims_to_transpose)
 
 
+def _grouped_logical_shape(operand):
+    """Recover the LOGICAL (pre-rotation) original_shape of a grouped operand.
+
+    ScaledTensorFactory.create_1x rotates ``original_shape`` when ``data_layout="T"``
+    (NVFP4 colwise) — group axis at position 0 stays put, the remaining axes get
+    swapped around flatten_axis.  The cuBLASLt grouped GEMM internally re-applies that
+    swap via ``swap_dims=true`` when NVFP4 forces TN, so the JAX side must hand it the
+    un-rotated (logical) shape and contract_dim.
+
+    Returns the input ``operand.original_shape`` unchanged when no rotation happened
+    (data_layout != "T", or operand has no data_layout attr).
+    """
+    data_layout = getattr(operand, "data_layout", None)
+    if data_layout != "T":
+        return operand.original_shape
+
+    post_shape = operand.original_shape
+    ndim = len(post_shape)
+    post_flatten_axis = operand.flatten_axis  # already normalized to positive in create_1x
+    has_group_axis = operand.first_dims is None or operand.first_dims.size == 0
+    if has_group_axis:
+        # create_1x kernel-style rotation: post = (orig[0], *orig[pre:], *orig[1:pre])
+        # with post_flatten_axis = ndim - pre + 1 → pre = ndim - post + 1.
+        pre_flatten_axis = ndim - post_flatten_axis + 1
+        return (
+            post_shape[0],
+            *post_shape[ndim - pre_flatten_axis + 1 :],
+            *post_shape[1 : ndim - pre_flatten_axis + 1],
+        )
+    # lhs-style rotation: post = (*orig[pre:], *orig[:pre])
+    # with post_flatten_axis = ndim - pre → pre = ndim - post.
+    pre_flatten_axis = ndim - post_flatten_axis
+    return (
+        *post_shape[ndim - pre_flatten_axis :],
+        *post_shape[: ndim - pre_flatten_axis],
+    )
+
+
 def _compatible_fp8_gemm_dtypes(lhs_dtype, rhs_dtype) -> bool:
     lhs, rhs, e4m3, e5m2 = map(
         dtypes.canonicalize_dtype,
@@ -2459,27 +2497,34 @@ def grouped_gemm(
 
     # Pre-compute collapsed 2D sizes from original N-D shapes.
     # These are static Python ints passed as primitive parameters (must be hashable).
-    lhs_left_size = math.prod(lhs.original_shape[:lhs_axis_boundary])
-    lhs_right_size = math.prod(lhs.original_shape[lhs_axis_boundary:])
-    rhs_left_size = math.prod(rhs.original_shape[:rhs_axis_boundary])
-    rhs_right_size = math.prod(rhs.original_shape[rhs_axis_boundary:])
+    # Use the LOGICAL (pre-rotation) shape: NVFP4 colwise tensors get their
+    # original_shape rotated by ScaledTensorFactory.create_1x to mirror the
+    # transposed-quantized data layout, but the cuBLASLt grouped GEMM expects un-
+    # rotated dims (it switches to colwise + swap_dims internally based on the
+    # un-remapped is_trans flag).
+    lhs_logical_shape = _grouped_logical_shape(lhs)
+    rhs_logical_shape = _grouped_logical_shape(rhs)
+    lhs_left_size = math.prod(lhs_logical_shape[:lhs_axis_boundary])
+    lhs_right_size = math.prod(lhs_logical_shape[lhs_axis_boundary:])
+    rhs_left_size = math.prod(rhs_logical_shape[:rhs_axis_boundary])
+    rhs_right_size = math.prod(rhs_logical_shape[rhs_axis_boundary:])
 
     # Pre-compute output shape from N-D input shapes (static Python ints).
     if lhs_is_trans:
-        lhs_non_contracting = lhs.original_shape[lhs_axis_boundary:]
+        lhs_non_contracting = lhs_logical_shape[lhs_axis_boundary:]
     else:
-        lhs_non_contracting = lhs.original_shape[:lhs_axis_boundary]
+        lhs_non_contracting = lhs_logical_shape[:lhs_axis_boundary]
     if rhs_is_trans:
         if rhs.first_dims is not None or rhs.last_dims is not None:
             # wgrad: rhs (e.g. grad_T of shape (N, M)) has no G batch dim; include all dims
-            rhs_non_contracting = tuple(rhs.original_shape[d] for d in range(rhs_axis_boundary))
+            rhs_non_contracting = tuple(rhs_logical_shape[d] for d in range(rhs_axis_boundary))
         else:
             # fwd/dgrad: rhs (e.g. kernel_T of shape (G, N, K)) has G batch dim at dim 0; skip it
             rhs_non_contracting = tuple(
-                rhs.original_shape[d] for d in range(rhs_axis_boundary) if d != 0
+                rhs_logical_shape[d] for d in range(rhs_axis_boundary) if d != 0
             )
     else:
-        rhs_non_contracting = rhs.original_shape[rhs_axis_boundary:]
+        rhs_non_contracting = rhs_logical_shape[rhs_axis_boundary:]
     if rhs.first_dims is not None or rhs.last_dims is not None:
         out_shape = (num_gemms, *lhs_non_contracting, *rhs_non_contracting)
     else:
