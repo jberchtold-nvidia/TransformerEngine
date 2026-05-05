@@ -1102,10 +1102,39 @@ class QuantizerFactory:
                 warnings.warn(
                     "Using more than one GroupedQuantizer for a grouped input is not recommended"
                 )
-            quantizer_type = GroupedQuantizer
-            kwargs["n_groups"] = n_groups
-        else:
-            quantizer_type = QuantizerFactory.quantizer_type_map.get(scaling_mode)
+            # GroupedQuantizer wraps a tuple of per-group quantizers but doesn't itself
+            # accept arbitrary per-quantizer kwargs (e.g. use_rht, stochastic_rounding_rng_state).
+            # Pre-create the per-group sub-quantizers with the extra kwargs and pass them
+            # in via the `quantizers` field so __post_init__ doesn't drop them.
+            sub_quantizer_type = QuantizerFactory.quantizer_type_map.get(scaling_mode)
+            if scaling_mode == ScalingMode.NO_SCALING:
+                quantizers = [None] * n_quantizers
+            else:
+                quantizers = []
+                for _ in range(n_quantizers):
+                    sub_quantizers = tuple(
+                        sub_quantizer_type(
+                            q_dtype=q_dtype,
+                            scaling_mode=scaling_mode,
+                            q_layout=q_layout,
+                            checkpoint_name=checkpoint_name,
+                            **kwargs,
+                        )
+                        for _ in range(n_groups)
+                    )
+                    quantizers.append(
+                        GroupedQuantizer(
+                            q_dtype=q_dtype,
+                            scaling_mode=scaling_mode,
+                            q_layout=q_layout,
+                            checkpoint_name=checkpoint_name,
+                            n_groups=n_groups,
+                            quantizers=sub_quantizers,
+                        )
+                    )
+            return quantizers[0] if len(quantizers) == 1 else tuple(quantizers)
+
+        quantizer_type = QuantizerFactory.quantizer_type_map.get(scaling_mode)
 
         if scaling_mode == ScalingMode.NO_SCALING:
             quantizers = [None] * n_quantizers
@@ -1168,7 +1197,12 @@ class QuantizerFactory:
             args_kernel = quantize_meta_set.kernel.get_kwargs_dictionary()
             args_grad = quantize_meta_set.grad.get_kwargs_dictionary()
         else:
-            args_x = args_kernel = args_grad = {}
+            # Forward unrecognised create_set kwargs (e.g. use_rht=True,
+            # stochastic_rounding_rng_state=...) to all per-tensor quantizers.
+            extra = {k: v for k, v in kwargs.items() if k != "quantize_meta_set"}
+            args_x = dict(extra)
+            args_kernel = dict(extra)
+            args_grad = dict(extra)
 
         q_x = QuantizerFactory.create(
             1,

@@ -316,11 +316,23 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(DequantizeHandler, DequantizeFFI,
                               FFI_CudaGraph_Traits);
 
 Error_Type GroupedQuantizeFFI(cudaStream_t stream, Buffer_Type inputs, Buffer_Type scales,
-                              Buffer_Type group_sizes, Result_Type outputs,
+                              Buffer_Type group_sizes, Buffer_Type sr_rng_state_unused,
+                              Buffer_Type hadamard_matrix_unused, Result_Type outputs,
                               Result_Type colwise_outputs, Result_Type scale_invs,
                               Result_Type colwise_scale_invs, Result_Type amaxs,
-                              Result_Type _unused, JAXX_Scaling_Mode scaling_mode,
+                              Result_Type colwise_amaxs_unused,
+                              Result_Type quant_workspace_unused, Result_Type int64_workspace_unused,
+                              JAXX_Scaling_Mode scaling_mode,
                               JAXX_Quantize_Layout quantize_layout, int64_t flatten_axis) {
+  // sr_rng_state_unused / hadamard_matrix_unused exist so the V1 handler matches the
+  // unified Python primitive's input arity (V2 NVFP4 needs them).
+  // colwise_amaxs_unused / quant_workspace_unused / int64_workspace_unused exist so that
+  // the V1 handler matches the unified abstract output count (V2 NVFP4 needs them).
+  (void)sr_rng_state_unused;
+  (void)hadamard_matrix_unused;
+  (void)colwise_amaxs_unused;
+  (void)quant_workspace_unused;
+  (void)int64_workspace_unused;
   NVTE_CHECK(scaling_mode != JAXX_Scaling_Mode::NO_SCALING,
              "Unsupported scaling mode: ", static_cast<int>(scaling_mode));
 
@@ -493,30 +505,81 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<Buffer_Type>()      // input
         .Arg<Buffer_Type>()      // scale
         .Arg<Buffer_Type>()      // group_sizes
-        .Ret<Buffer_Type>()      // output
+        .Arg<Buffer_Type>()      // sr_rng_state (V2 NVFP4 only; unused here)
+        .Arg<Buffer_Type>()      // hadamard_matrix (V2 NVFP4 only; unused here)
+        .Ret<Buffer_Type>()      // output (rowwise)
         .Ret<Buffer_Type>()      // colwise output
-        .Ret<Buffer_Type>()      // scale_inv
+        .Ret<Buffer_Type>()      // scale_inv (rowwise)
         .Ret<Buffer_Type>()      // scale_inv colwise
-        .Ret<Buffer_Type>()      // amax
-        .Ret<Buffer_Type>()      // unused (for compatibility with V2 interface)
+        .Ret<Buffer_Type>()      // rowwise amax / updated_amax
+        .Ret<Buffer_Type>()      // colwise amax (V2 NVFP4 only; unused here)
+        .Ret<Buffer_Type>()      // quant_workspace (V2 NVFP4 only; unused here)
+        .Ret<Buffer_Type>()      // int64_workspace (V2 only; unused here)
         .Attr<JAXX_Scaling_Mode>("scaling_mode")
         .Attr<JAXX_Quantize_Layout>("q_layout")
         .Attr<int64_t>("flatten_axis"));
 
+// V2 grouped quantize. Handles MXFP8 (nvte_group_quantize) and NVFP4
+// (nvte_group_hadamard_transform_*_graph_safe) in a single FFI handler.  Branches on the
+// `scaling_mode` attribute.  Buffers that don't apply to the active mode (e.g.
+// hadamard_matrix for MXFP8, colwise_amaxs for MXFP8) must still be passed but may be
+// empty.
+//
+// Inputs:
+//   inputs           : packed float input (BF16/FP16/FP32), shape derived from flatten_axis
+//   scale_unused     : ignored (matches V1 input arity)
+//   group_sizes      : (G,) int32 group sizes on device
+//   sr_rng_state     : (4,) uint32 / (2,) int64 stochastic-rounding state.  Only consumed
+//                      when scaling_mode=NVFP4_1D_SCALING and stochastic_rounding=true.
+//                      May be empty for MXFP8.
+//   hadamard_matrix  : (16, 16) bf16 Hadamard matrix.  Only consumed when scaling_mode=
+//                      NVFP4_1D_SCALING.  May be empty for MXFP8.
+//
+// Outputs:
+//   rowwise_out      : packed quantized data, rowwise (cast only for NVFP4)
+//   colwise_out      : packed quantized data, colwise (RHT + cast for NVFP4)
+//   rowwise_sinv     : block scales for rowwise data (E8M0 for MXFP8 / E4M3 for NVFP4)
+//   colwise_sinv     : block scales for colwise data
+//   rowwise_amaxs    : (G,) float32 — populated for NVFP4, dummy for MXFP8
+//   colwise_amaxs    : (G,) float32 — populated for NVFP4, may be empty for MXFP8
+//   quant_workspace  : tile-scheduler workspace (>= 4 bytes for NVFP4, may be empty for MXFP8)
+//   int64_workspace  : (2*G+1)*8 bytes (group_sizes + offsets)
+//
+// Attrs:
+//   scaling_mode        : MXFP8_1D_SCALING or NVFP4_1D_SCALING
+//   q_layout            : ROWWISE / COLWISE / ROWWISE_COLWISE
+//   flatten_axis        : axis split for 2D view of input
+//   stochastic_rounding : NVFP4-only; ignored for MXFP8
+//   random_sign_mask_t  : NVFP4-only; ignored for MXFP8
 Error_Type GroupedQuantizeV2FFI(cudaStream_t stream, Buffer_Type inputs, Buffer_Type scale_unused,
-                                Buffer_Type group_sizes, Result_Type rowwise_out,
+                                Buffer_Type group_sizes, Buffer_Type sr_rng_state,
+                                Buffer_Type hadamard_matrix, Result_Type rowwise_out,
                                 Result_Type colwise_out, Result_Type rowwise_sinv,
-                                Result_Type colwise_sinv, Result_Type updated_amaxs,
-                                Result_Type int64_workspace, JAXX_Quantize_Layout quantize_layout,
-                                int64_t flatten_axis) {
-  (void)scale_unused;  // scale is unused for MXFP8; accepted to match V1 input arity
+                                Result_Type colwise_sinv, Result_Type rowwise_amaxs,
+                                Result_Type colwise_amaxs, Result_Type quant_workspace,
+                                Result_Type int64_workspace, JAXX_Scaling_Mode scaling_mode,
+                                JAXX_Quantize_Layout quantize_layout, int64_t flatten_axis,
+                                bool stochastic_rounding, int64_t random_sign_mask_t) {
+  (void)scale_unused;  // matches V1 input arity
+
+  const bool is_mxfp8 = scaling_mode == JAXX_Scaling_Mode::MXFP8_1D_SCALING;
+  const bool is_nvfp4 = scaling_mode == JAXX_Scaling_Mode::NVFP4_1D_SCALING;
+  NVTE_CHECK(is_mxfp8 || is_nvfp4,
+             "GroupedQuantizeV2 supports MXFP8_1D_SCALING and NVFP4_1D_SCALING only.");
+
   auto in_dtype = convert_ffi_datatype_to_te_dtype(inputs.element_type());
   auto out_dtype = convert_ffi_datatype_to_te_dtype(rowwise_out->element_type());
   auto sinv_dtype = convert_ffi_datatype_to_te_dtype(rowwise_sinv->element_type());
 
-  NVTE_CHECK(is_fp8_dtype(out_dtype), "Output datatype must be FP8 for GroupedQuantizeV2.");
-  NVTE_CHECK(sinv_dtype == DType::kFloat8E8M0,
-             "scale_inv must be E8M0 for MXFP8 grouped quantize.");
+  if (is_mxfp8) {
+    NVTE_CHECK(is_fp8_dtype(out_dtype), "MXFP8 output datatype must be FP8.");
+    NVTE_CHECK(sinv_dtype == DType::kFloat8E8M0,
+               "scale_inv must be E8M0 for MXFP8 grouped quantize.");
+  } else {
+    NVTE_CHECK(is_fp4_dtype(out_dtype), "NVFP4 output datatype must be FP4.");
+    NVTE_CHECK(sinv_dtype == DType::kFloat8E4M3,
+               "scale_inv must be E4M3 for NVFP4 grouped quantize.");
+  }
 
   auto input_dims = inputs.dimensions();
   int64_t input_ndim = input_dims.size();
@@ -564,6 +627,10 @@ Error_Type GroupedQuantizeV2FFI(cudaStream_t stream, Buffer_Type inputs, Buffer_
   offsets_shape.ndim = 1;
   offsets_shape.data[0] = n_groups + 1;
 
+  NVTEShape amax_shape{};
+  amax_shape.ndim = 1;
+  amax_shape.data[0] = n_groups;
+
   // Build input grouped tensor (plain float data, no quantization on the input side).
   GroupedTensorWrapper in_grouped(n_groups, data_shape,
                                   get_nvte_scaling_mode(JAXX_Scaling_Mode::NO_SCALING));
@@ -573,48 +640,99 @@ Error_Type GroupedQuantizeV2FFI(cudaStream_t stream, Buffer_Type inputs, Buffer_
       .set_tensor_offsets(reinterpret_cast<void *>(offsets_ptr_out), DType::kInt64, offsets_shape);
 
   // Build output grouped tensor.
-  GroupedTensorWrapper out_grouped(n_groups, data_shape,
-                                   get_nvte_scaling_mode(JAXX_Scaling_Mode::MXFP8_1D_SCALING));
+  GroupedTensorWrapper out_grouped(n_groups, data_shape, get_nvte_scaling_mode(scaling_mode));
   out_grouped.set_first_dims(reinterpret_cast<void *>(int64_ptr), DType::kInt64, sz_shape)
       .set_tensor_offsets(reinterpret_cast<void *>(offsets_ptr_out), DType::kInt64, offsets_shape);
 
-  // Rowwise output data + scale_inv.
+  // Block size: 32 for MXFP8, 16 for NVFP4.
+  const size_t block_size = is_mxfp8 ? 32 : 16;
+
+  // Rowwise output data + scale_inv (+ amax for NVFP4).
   if (is_quantize_rowwise(quantize_layout)) {
     NVTEShape rw_sinv_shape{};
     rw_sinv_shape.ndim = 2;
     rw_sinv_shape.data[0] = m;
-    rw_sinv_shape.data[1] = n / 32;  // MXFP8 block size = 32
+    rw_sinv_shape.data[1] = n / block_size;
     out_grouped.set_rowwise_data(rowwise_out->untyped_data(), out_dtype, data_shape)
         .set_rowwise_scale_inv(rowwise_sinv->untyped_data(), sinv_dtype, rw_sinv_shape);
+    if (is_nvfp4) {
+      out_grouped.set_amax(rowwise_amaxs->untyped_data(), DType::kFloat32, amax_shape);
+    }
   }
 
-  // Colwise output data + scale_inv.
+  // Colwise output data + scale_inv (+ post-RHT amax for NVFP4).
   if (is_quantize_colwise(quantize_layout)) {
     NVTEShape cw_sinv_shape{};
     cw_sinv_shape.ndim = 2;
-    cw_sinv_shape.data[0] = m / 32;  // MXFP8 block size = 32
+    cw_sinv_shape.data[0] = m / block_size;
     cw_sinv_shape.data[1] = n;
     out_grouped.set_columnwise_data(colwise_out->untyped_data(), out_dtype, data_shape)
         .set_columnwise_scale_inv(colwise_sinv->untyped_data(), sinv_dtype, cw_sinv_shape);
+    if (is_nvfp4) {
+      out_grouped.set_columnwise_amax(colwise_amaxs->untyped_data(), DType::kFloat32, amax_shape);
+    }
   }
 
-  // Zero-initialize scale_inv buffers (mirrors V1 behaviour for MXFP8).
-  size_t total_rowwise_sinv_size =
-      is_quantize_rowwise(quantize_layout) ? product(rowwise_sinv->dimensions()) : 0;
-  size_t total_colwise_sinv_size =
-      is_quantize_colwise(quantize_layout) ? product(colwise_sinv->dimensions()) : 0;
-  if (total_rowwise_sinv_size > 0)
-    nvte_memset(rowwise_sinv->untyped_data(), 0, total_rowwise_sinv_size, stream);
-  if (total_colwise_sinv_size > 0)
-    nvte_memset(colwise_sinv->untyped_data(), 0, total_colwise_sinv_size, stream);
-
-  // V2 grouped quantize is always paired with V2 grouped GEMM, which expects
-  // scale_inv in GEMM-swizzled layout.  Enable the fused swizzle so the kernel
-  // writes scales in the layout the GEMM will consume directly.
+  // V2 grouped quantize is always paired with V2 grouped GEMM, which expects scale_inv in
+  // GEMM-swizzled layout.  The MXFP8 nvte_group_quantize and the NVFP4
+  // nvte_group_hadamard_transform_cast_fusion_graph_safe both honour this flag and write
+  // scales in the layout the GEMM consumes directly.
   out_grouped.set_with_gemm_swizzled_scales(true);
 
+  if (is_mxfp8) {
+    // Zero-initialize scale_inv buffers (mirrors V1 behaviour for MXFP8).
+    size_t total_rowwise_sinv_size =
+        is_quantize_rowwise(quantize_layout) ? product(rowwise_sinv->dimensions()) : 0;
+    size_t total_colwise_sinv_size =
+        is_quantize_colwise(quantize_layout) ? product(colwise_sinv->dimensions()) : 0;
+    if (total_rowwise_sinv_size > 0)
+      nvte_memset(rowwise_sinv->untyped_data(), 0, total_rowwise_sinv_size, stream);
+    if (total_colwise_sinv_size > 0)
+      nvte_memset(colwise_sinv->untyped_data(), 0, total_colwise_sinv_size, stream);
+
+    QuantizationConfigWrapper quant_config{};
+    nvte_group_quantize(in_grouped.data(), out_grouped.data(), quant_config, stream);
+    return ffi_with_cuda_error_check();
+  }
+
+  // NVFP4 graph-safe RHT path (mirrors PyTorch
+  // transformer_engine/pytorch/csrc/extensions/cast.cpp).  The non-RHT graph-safe NVFP4
+  // grouped kernel does not exist today.
   QuantizationConfigWrapper quant_config{};
-  nvte_group_quantize(in_grouped.data(), out_grouped.data(), quant_config, stream);
+  TensorWrapper sr_rng_state_tensor(sr_rng_state.untyped_data(), std::vector<size_t>{2},
+                                    DType::kInt64);
+  if (stochastic_rounding) {
+    NVTE_CHECK(sr_rng_state.size_bytes() == 2 * sizeof(uint64_t),
+               "rng_state must be of type int64[2] for NVFP4 stochastic rounding.");
+    NVTE_CHECK(sr_rng_state.untyped_data() != nullptr, "rng_state must be provided for SR.");
+    quant_config.set_stochastic_rounding(true);
+    quant_config.set_rng_state(sr_rng_state_tensor.data());
+  }
+
+  // Step 1: compute per-group rowwise + post-RHT (colwise) amaxes.
+  // random_sign_mask=0 (no RHT applied to rowwise amax computation since rowwise output
+  // is plain cast); random_sign_mask_t drives the post-RHT amax direction for colwise.
+  nvte_group_hadamard_transform_amax_graph_safe(in_grouped.data(), out_grouped.data(),
+                                                /*random_sign_mask=*/0,
+                                                static_cast<int>(random_sign_mask_t), stream);
+
+  // Step 2: cast (rowwise) + RHT cast fusion (colwise) in one fused pass.
+  NVTE_CHECK(convert_ffi_datatype_to_te_dtype(hadamard_matrix.element_type()) == DType::kBFloat16,
+             "Hadamard matrix must be bf16.");
+  NVTE_CHECK(hadamard_matrix.dimensions().size() == 2 && hadamard_matrix.dimensions()[0] == 16 &&
+                 hadamard_matrix.dimensions()[1] == 16,
+             "Hadamard matrix must be 16x16.");
+  TensorWrapper hadamard_matrix_tensor(hadamard_matrix.untyped_data(),
+                                       std::vector<size_t>{16, 16}, DType::kBFloat16);
+
+  // Tile scheduler workspace (>= 4 bytes per the API).
+  TensorWrapper quant_workspace_tensor(
+      quant_workspace->untyped_data(),
+      std::vector<size_t>{product(quant_workspace->dimensions())}, DType::kByte);
+
+  nvte_group_hadamard_transform_cast_fusion_graph_safe(
+      in_grouped.data(), out_grouped.data(), hadamard_matrix_tensor.data(), quant_config,
+      quant_workspace_tensor.data(), stream);
 
   return ffi_with_cuda_error_check();
 }
@@ -625,14 +743,21 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(GroupedQuantizeV2Handler, GroupedQuantizeV2FFI,
                                   .Arg<Buffer_Type>()      // inputs
                                   .Arg<Buffer_Type>()      // scale (unused, for input arity match)
                                   .Arg<Buffer_Type>()      // group_sizes (int32)
+                                  .Arg<Buffer_Type>()      // sr_rng_state (NVFP4 SR; empty otherwise)
+                                  .Arg<Buffer_Type>()      // hadamard_matrix (NVFP4 RHT; empty otherwise)
                                   .Ret<Buffer_Type>()      // rowwise_out
                                   .Ret<Buffer_Type>()      // colwise_out
                                   .Ret<Buffer_Type>()      // rowwise_sinv
                                   .Ret<Buffer_Type>()      // colwise_sinv
-                                  .Ret<Buffer_Type>()      // updated_amaxs
+                                  .Ret<Buffer_Type>()      // rowwise_amaxs
+                                  .Ret<Buffer_Type>()      // colwise_amaxs (NVFP4; empty for MXFP8)
+                                  .Ret<Buffer_Type>()      // quant_workspace (NVFP4; empty for MXFP8)
                                   .Ret<Buffer_Type>()      // int64_workspace
+                                  .Attr<JAXX_Scaling_Mode>("scaling_mode")
                                   .Attr<JAXX_Quantize_Layout>("q_layout")
-                                  .Attr<int64_t>("flatten_axis"),
+                                  .Attr<int64_t>("flatten_axis")
+                                  .Attr<bool>("stochastic_rounding")
+                                  .Attr<int64_t>("random_sign_mask_t"),
                               FFI_CudaGraph_Traits);
 
 }  // namespace jax

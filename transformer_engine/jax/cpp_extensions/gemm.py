@@ -1433,10 +1433,14 @@ class GroupedGemmPrimitive(BasePrimitive):
     name = "te_grouped_gemm_ffi"
     # args = lhs_data, lhs_scale_inv, rhs_data, rhs_scale_inv, bias,
     #        lhs_first_dims, lhs_last_dims, rhs_first_dims, rhs_last_dims,
-    #        out_first_dims, out_last_dims, alpha, beta
+    #        out_first_dims, out_last_dims,
+    #        additional_arg_0 (alpha for V2, group_offset for V1),
+    #        additional_arg_1 (beta for V2, unused for V1),
+    #        additional_arg_2 (lhs_amax for V2 NVFP4, empty otherwise),
+    #        additional_arg_3 (rhs_amax for V2 NVFP4, empty otherwise)
     name_graph_safe = "te_grouped_gemm_v2_ffi"
     multiple_results = True
-    impl_static_args = (13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26)
+    impl_static_args = (15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28)
     inner_primitive = None
     outer_primitive = None
 
@@ -1565,12 +1569,13 @@ class GroupedGemmPrimitive(BasePrimitive):
                 shape=(int64_workspace_size,), dtype=jnp.uint8
             )
 
-            if len(additional_args) != 2:
+            if len(additional_args) != 4:
                 raise ValueError(
-                    "Expected additional_args to contain alpha, beta for the graph-safe grouped"
-                    f" GEMM primitive, but got {len(additional_args)} arguments."
+                    "Expected additional_args to contain alpha, beta, lhs_amax, rhs_amax for the"
+                    " graph-safe grouped GEMM primitive, but got"
+                    f" {len(additional_args)} arguments."
                 )
-            alpha_aval, beta_aval = additional_args
+            alpha_aval, beta_aval, lhs_amax_aval, rhs_amax_aval = additional_args
             if alpha_aval.shape != (num_groups,):
                 raise ValueError(f"Expected alpha shape {(num_groups,)}, got {alpha_aval.shape}")
             if alpha_aval.dtype != jnp.float32:
@@ -1579,6 +1584,30 @@ class GroupedGemmPrimitive(BasePrimitive):
                 raise ValueError(f"Expected beta shape {(num_groups,)}, got {beta_aval.shape}")
             if beta_aval.dtype != jnp.float32:
                 raise ValueError(f"Expected beta dtype float32, got {beta_aval.dtype}")
+            # lhs_amax/rhs_amax: (num_groups,) float32 for NVFP4, empty (0,) otherwise.
+            is_nvfp4 = ScalingMode(scaling_mode) == ScalingMode.NVFP4_1D_SCALING
+            if is_nvfp4:
+                if lhs_amax_aval.shape != (num_groups,):
+                    raise ValueError(
+                        f"Expected lhs_amax shape {(num_groups,)} for NVFP4 V2 grouped GEMM, got"
+                        f" {lhs_amax_aval.shape}"
+                    )
+                if rhs_amax_aval.shape != (num_groups,):
+                    raise ValueError(
+                        f"Expected rhs_amax shape {(num_groups,)} for NVFP4 V2 grouped GEMM, got"
+                        f" {rhs_amax_aval.shape}"
+                    )
+                if lhs_amax_aval.dtype != jnp.float32 or rhs_amax_aval.dtype != jnp.float32:
+                    raise ValueError(
+                        "lhs_amax/rhs_amax must be float32 for NVFP4 V2 grouped GEMM, got"
+                        f" lhs={lhs_amax_aval.dtype} rhs={rhs_amax_aval.dtype}"
+                    )
+            else:
+                if lhs_amax_aval.size != 0 or rhs_amax_aval.size != 0:
+                    raise ValueError(
+                        "lhs_amax/rhs_amax must be empty (size 0) for non-NVFP4 V2 grouped GEMM,"
+                        f" got lhs.size={lhs_amax_aval.size} rhs.size={rhs_amax_aval.size}"
+                    )
 
             return (out_aval, cublas_workspace_aval, setup_workspace_aval, int64_workspace_aval)
 
@@ -1685,8 +1714,10 @@ class GroupedGemmPrimitive(BasePrimitive):
         rhs_last_dims,
         out_first_dims,
         out_last_dims,
-        additional_arg_0,  # group_offset (non-graph-safe) OR alpha (graph-safe)
-        additional_arg_1,  # unused placeholder (non-graph-safe) OR beta (graph-safe)
+        additional_arg_0,  # group_offset (V1) OR alpha (V2)
+        additional_arg_1,  # unused placeholder (V1) OR beta (V2)
+        additional_arg_2,  # unused (V1) OR lhs_amax (V2 NVFP4) / empty (V2 non-NVFP4)
+        additional_arg_3,  # unused (V1) OR rhs_amax (V2 NVFP4) / empty (V2 non-NVFP4)
         lhs_is_trans,
         rhs_is_trans,
         scaling_mode,
@@ -1705,7 +1736,12 @@ class GroupedGemmPrimitive(BasePrimitive):
         if GroupedGemmPrimitive.inner_primitive is None:
             raise RuntimeError("GroupedGemmPrimitive.inner_primitive has not been registered")
         if use_v2_ffi:
-            additional_args = (additional_arg_0, additional_arg_1)
+            additional_args = (
+                additional_arg_0,
+                additional_arg_1,
+                additional_arg_2,
+                additional_arg_3,
+            )
         else:
             additional_args = (additional_arg_0,)
         (out, *_) = GroupedGemmPrimitive.inner_primitive.bind(
@@ -2073,17 +2109,18 @@ def _is_v2_grouped_gemm_supported(
     if scaling_mode == ScalingMode.NO_SCALING and dtype == jnp.bfloat16:
         return True, ""
 
-    if scaling_mode == ScalingMode.MXFP8_1D_SCALING:
-        # V2 MXFP8 requires that the total first dimension of both operands (up to
-        # axis_boundary) is divisible by 128, matching the quantize V2 kernel requirement.
-        # Individual group sizes must also be 128-aligned (dynamic constraint).
+    if scaling_mode in (ScalingMode.MXFP8_1D_SCALING, ScalingMode.NVFP4_1D_SCALING):
+        # V2 MXFP8 / NVFP4 require 128-aligned dimensions for the V2 grouped GEMM setup
+        # kernel to compute scale offsets correctly across groups.  Individual group sizes
+        # must also be 128-aligned (dynamic constraint).
+        mode_name = "MXFP8" if scaling_mode == ScalingMode.MXFP8_1D_SCALING else "NVFP4"
         if lhs_shape is not None and lhs_axis_boundary is not None:
             lhs_first_dim = math.prod(lhs_shape[:lhs_axis_boundary])
             if lhs_first_dim % 128 != 0:
                 return (
                     False,
                     (
-                        "The TE V2 grouped GEMM for MXFP8 requires the product of the first"
+                        f"The TE V2 grouped GEMM for {mode_name} requires the product of the first"
                         " dimensions (up to axis_boundary) of LHS to be divisible by 128, but got"
                         f" {lhs_first_dim} with lhs_shape={lhs_shape} and"
                         f" lhs_axis_boundary={lhs_axis_boundary}."
@@ -2095,22 +2132,22 @@ def _is_v2_grouped_gemm_supported(
                 return (
                     False,
                     (
-                        "The TE V2 grouped GEMM for MXFP8 requires the product of the first"
+                        f"The TE V2 grouped GEMM for {mode_name} requires the product of the first"
                         " dimensions (up to axis_boundary) of RHS to be divisible by 128, but got"
                         f" {rhs_first_dim} with rhs_shape={rhs_shape} and"
                         f" rhs_axis_boundary={rhs_axis_boundary}."
                     ),
                 )
 
-        # V2 MXFP8 also requires that the "last" dimension (after axis_boundary) of both
-        # operands is a multiple of 128. This is because the MXFP8 scales must be padded to a multiple of (128, 4). The nvte_grouped_gemm setup kernels only handle the case when this dim is a multiple of 128 as well. If it is not, the GEMM setup kernel will not compute the scale offsets correctly and will read overlapping scales from the previous group, causing incorrect results.
+        # V2 MXFP8/NVFP4 also requires that the "last" dimension (after axis_boundary) of both
+        # operands is a multiple of 128. This is because block scales must be padded to a multiple of (128, 4). The nvte_grouped_gemm setup kernels only handle the case when this dim is a multiple of 128 as well. If it is not, the GEMM setup kernel will not compute the scale offsets correctly and will read overlapping scales from the previous group, causing incorrect results.
         if lhs_shape is not None and lhs_axis_boundary is not None:
             lhs_last_dim = math.prod(lhs_shape[lhs_axis_boundary:])
             if lhs_last_dim % 128 != 0:
                 return (
                     False,
                     (
-                        "The TE V2 grouped GEMM for MXFP8 requires the product of the last"
+                        f"The TE V2 grouped GEMM for {mode_name} requires the product of the last"
                         " dimensions (after axis_boundary) of LHS to be divisible by 128, but got"
                         f" {lhs_last_dim} with lhs_shape={lhs_shape} and"
                         f" lhs_axis_boundary={lhs_axis_boundary}."
@@ -2122,7 +2159,7 @@ def _is_v2_grouped_gemm_supported(
                 return (
                     False,
                     (
-                        "The TE V2 grouped GEMM for MXFP8 requires the product of the last"
+                        f"The TE V2 grouped GEMM for {mode_name} requires the product of the last"
                         " dimensions (after axis_boundary) of RHS to be divisible by 128, but got"
                         f" {rhs_last_dim} with rhs_shape={rhs_shape} and"
                         f" rhs_axis_boundary={rhs_axis_boundary}."
@@ -2133,11 +2170,12 @@ def _is_v2_grouped_gemm_supported(
     return (
         False,
         (
-            "The TE V2 grouped GEMM currently only supports non-quantized BF16 and MXFP8 with 1D"
-            " block scaling, but NVTE_JAX_ENFORCE_V2_GROUPED_GEMM is enabled and the input"
-            f" parameters do not meet these requirements (scaling_mode= {scaling_mode},"
-            f" dtype={dtype}, has_bias={has_bias}, lhs_shape={lhs_shape}, rhs_shape={rhs_shape},"
-            f" lhs_axis_boundary={lhs_axis_boundary}, rhs_axis_boundary={rhs_axis_boundary})."
+            "The TE V2 grouped GEMM currently only supports non-quantized BF16, MXFP8 with 1D"
+            " block scaling, and NVFP4 with 1D scaling, but NVTE_JAX_ENFORCE_V2_GROUPED_GEMM is"
+            " enabled and the input parameters do not meet these requirements (scaling_mode="
+            f" {scaling_mode}, dtype={dtype}, has_bias={has_bias}, lhs_shape={lhs_shape},"
+            f" rhs_shape={rhs_shape}, lhs_axis_boundary={lhs_axis_boundary},"
+            f" rhs_axis_boundary={rhs_axis_boundary})."
         ),
     )
 
@@ -2482,12 +2520,54 @@ def grouped_gemm(
         if not rhs.pre_swizzled:
             raise ValueError("rhs must be pre-swizzled for MXFP8 1D scaling")
 
+    if scaling_mode == ScalingMode.NVFP4_1D_SCALING:
+        # NVFP4 only flows through V2 (cuBLASLt grouped GEMM with VEC16_UE4M3 scales).
+        if not use_v2_ffi:
+            raise ValueError(
+                "NVFP4 grouped GEMM requires the V2 (graph-safe) path; the input shape or"
+                " scaling configuration falls outside the V2 supported range."
+            )
+        # NVFP4 V2 grouped quantize fuses swizzle into the cast-fusion kernel so the input
+        # tensors must be pre-swizzled.
+        if not lhs.pre_swizzled:
+            raise ValueError("lhs must be pre-swizzled for NVFP4 1D scaling")
+        if not rhs.pre_swizzled:
+            raise ValueError("rhs must be pre-swizzled for NVFP4 1D scaling")
+
+    is_nvfp4 = scaling_mode == ScalingMode.NVFP4_1D_SCALING
     if use_v2_ffi:
-        additional_arg_0 = jnp.ones((num_gemms,), jnp.float32)  # alpha
-        additional_arg_1 = jnp.zeros((num_gemms,), jnp.float32)  # beta
+        if is_nvfp4:
+            # cuBLASLt grouped GEMM computes per-group alpha as
+            # alpha[g] = global_alpha * lhs_amax[g] * rhs_amax[g] /
+            #            (NVFP4_MAX^2 * E4M3_MAX^2)
+            # inside its setup kernel.  We pass global_alpha=1.0 and let the per-tensor
+            # amaxes (set on the grouped tensors via set_amax) drive the scaling.
+            lhs_amax = lhs.amax
+            rhs_amax = rhs.amax
+            if lhs_amax is None or rhs_amax is None:
+                raise ValueError(
+                    "NVFP4 grouped GEMM requires per-group amax on both LHS and RHS operands."
+                )
+            if lhs_amax.shape != (num_gemms,) or rhs_amax.shape != (num_gemms,):
+                raise ValueError(
+                    "NVFP4 grouped GEMM expects per-group amax of shape"
+                    f" ({num_gemms},), got lhs.amax.shape={lhs_amax.shape},"
+                    f" rhs.amax.shape={rhs_amax.shape}"
+                )
+            additional_arg_0 = jnp.ones((num_gemms,), jnp.float32)  # alpha
+            additional_arg_1 = jnp.zeros((num_gemms,), jnp.float32)  # beta
+            additional_arg_2 = lhs_amax.astype(jnp.float32)
+            additional_arg_3 = rhs_amax.astype(jnp.float32)
+        else:
+            additional_arg_0 = jnp.ones((num_gemms,), jnp.float32)  # alpha
+            additional_arg_1 = jnp.zeros((num_gemms,), jnp.float32)  # beta
+            additional_arg_2 = jnp.empty((0,), jnp.float32)  # lhs_amax (unused)
+            additional_arg_3 = jnp.empty((0,), jnp.float32)  # rhs_amax (unused)
     else:
         additional_arg_0 = jnp.zeros((1,), jnp.int32)  # group_offset
         additional_arg_1 = jnp.zeros((0,), jnp.int32)  # unused placeholder
+        additional_arg_2 = jnp.empty((0,), jnp.float32)  # unused
+        additional_arg_3 = jnp.empty((0,), jnp.float32)  # unused
 
     (out,) = GroupedGemmPrimitive.outer_primitive.bind(
         lhs.data,
@@ -2503,6 +2583,8 @@ def grouped_gemm(
         out_last_dims if out_last_dims is not None else empty_gs,
         additional_arg_0,
         additional_arg_1,
+        additional_arg_2,
+        additional_arg_3,
         lhs_is_trans=lhs_is_trans,
         rhs_is_trans=rhs_is_trans,
         scaling_mode=scaling_mode.value,

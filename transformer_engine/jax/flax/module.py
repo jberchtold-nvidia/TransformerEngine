@@ -1454,13 +1454,25 @@ def make_dot_general_cls(quantization_recipe):
 
 def make_grouped_dense_cls(quantization_recipe, quantization_checkpoint_name: Optional[str] = None):
     """Creates a grouped dense (grouped GEMM) instance for use with TE state module."""
+    from transformer_engine.common.recipe import NVFP4BlockScaling
+
     if quantization_recipe is not None:
-        allowed_grouped_gemm_recipes = [MXFP8BlockScaling]
+        allowed_grouped_gemm_recipes = [MXFP8BlockScaling, NVFP4BlockScaling]
         assert any(isinstance(quantization_recipe, r) for r in allowed_grouped_gemm_recipes), (
             "Only the following quantization recipes are supported for grouped GEMM or `None` for"
             f" BF16 without quantization: {allowed_grouped_gemm_recipes}. Got"
             f" {type(quantization_recipe)}."
         )
+        if isinstance(quantization_recipe, NVFP4BlockScaling):
+            # The NVFP4 grouped quantize V2 path is implemented only for the RHT graph-safe
+            # cast-fusion kernel — the non-RHT graph-safe NVFP4 grouped quantize kernel does
+            # not exist today.  Mirrors the PyTorch behaviour
+            # (transformer_engine/pytorch/csrc/extensions/cast.cpp).
+            if getattr(quantization_recipe, "disable_rht", False):
+                raise ValueError(
+                    "NVFP4BlockScaling for grouped GEMM requires disable_rht=False (the non-RHT"
+                    " graph-safe NVFP4 grouped quantize kernel is not yet implemented)."
+                )
 
     def te_grouped_dot_general(generate_quantizer_set, x, kernel, group_sizes, **kwargs):
         del kwargs  # Unused
