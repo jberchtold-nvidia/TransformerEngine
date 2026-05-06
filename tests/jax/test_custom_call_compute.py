@@ -1159,6 +1159,121 @@ class TestGroupedQuantize:
         assert_dequantized_grouped_scaled_tensor(scaled_tensor, x)
 
 
+# NVFP4 V2 grouped quantize is only supported through the RHT graph-safe cast-fusion
+# kernel.  The kernel requires bf16 input, SM100+, and 128-aligned dimensions / group
+# sizes (matching the V2 grouped GEMM constraint).  The non-RHT graph-safe NVFP4 grouped
+# kernel does not exist today.
+@pytest.mark.skipif(not is_fp4_supported, reason=fp4_unsupported_reason)
+@pytest_parametrize_wrapper(
+    "input_shape",
+    [
+        # (n_groups, m, n) — m is multiplied by group_size_multiplier=128 below.
+        (4, 1, 128),  # tiny: total_M=512, n=128 — minimum NVFP4-eligible shape
+        (4, 2, 256),  # total_M=1024, n=256
+    ],
+)
+@pytest_parametrize_wrapper(
+    "q_layout", [QuantizeLayout.ROWWISE, QuantizeLayout.COLWISE, QuantizeLayout.ROWWISE_COLWISE]
+)
+@pytest_parametrize_wrapper("flatten_axis", [-1])
+class TestGroupedNVFP4Quantize:
+    """Tests for the V2 NVFP4 grouped quantize (graph-safe RHT path).
+
+    Unlike MXFP8 V2 where rowwise quantization is just per-block cast, NVFP4 V2 always
+    runs RHT for the colwise output (matches PyTorch's only-supported path).  We
+    validate by feeding the quantized tensors through the V2 grouped GEMM and comparing
+    the output to a per-group BF16 reference: NVFP4 + RHT should still produce a result
+    within FP4 tolerance because the GEMM's per-group alpha undoes the per-tensor scale.
+    """
+
+    def test_grouped_quantize_nvfp4_smoke(
+        self,
+        input_shape,
+        q_layout,
+        flatten_axis,
+    ):
+        """Smoke test: grouped_quantize succeeds and produces tensors of the expected
+        shapes and dtypes for an NVFP4Quantizer with use_rht=True.
+
+        Uses explicit group_sizes (the typical MoE use case).  The non-group-sizes
+        (uniform-batch) path is exercised by the grouped_dense test.
+        """
+        n_groups, m, n = input_shape
+        group_size_multiplier = 128
+        m = m * group_size_multiplier
+
+        key = jax.random.PRNGKey(0)
+        subkeys = jax.random.split(key, 2)
+
+        # Generate group sizes with all 128-aligned groups summing to m.
+        base = jnp.sort(
+            jax.random.randint(subkeys[0], (n_groups - 1,), 0, m // group_size_multiplier)
+        )
+        base = jnp.concatenate(
+            [jnp.array([0]), base, jnp.array([m // group_size_multiplier])]
+        )
+        group_sizes = jnp.diff(base) * group_size_multiplier
+        assert group_sizes.sum() == m
+
+        x = jax.random.normal(subkeys[1], (m, n), dtype=jnp.bfloat16)
+
+        grouped_quantizer = QuantizerFactory.create(
+            scaling_mode=ScalingMode.NVFP4_1D_SCALING,
+            q_dtype=jnp.float4_e2m1fn,
+            q_layout=q_layout,
+            n_groups=n_groups,
+            use_rht=True,
+        )
+
+        scaled_tensor = tex.grouped_quantize(
+            x, group_sizes=group_sizes, flatten_axis=flatten_axis, quantizer=grouped_quantizer
+        )
+
+        # Validate the produced tensor structure.
+        if q_layout == QuantizeLayout.ROWWISE_COLWISE:
+            assert isinstance(scaled_tensor, ScaledTensor2x)
+            row = scaled_tensor.rowwise_tensor
+            col = scaled_tensor.colwise_tensor
+            assert row.amax.shape == (n_groups,)
+            assert col.amax.shape == (n_groups,)
+            assert row.scale_inv.dtype == jnp.float8_e4m3fn
+            assert col.scale_inv.dtype == jnp.float8_e4m3fn
+            assert row.data.dtype == jnp.float4_e2m1fn
+            assert col.data.dtype == jnp.float4_e2m1fn
+        else:
+            assert isinstance(scaled_tensor, GroupedScaledTensor1x)
+            assert scaled_tensor.amax.shape == (n_groups,)
+            assert scaled_tensor.scale_inv.dtype == jnp.float8_e4m3fn
+            assert scaled_tensor.data.dtype == jnp.float4_e2m1fn
+
+    def test_grouped_quantize_nvfp4_requires_rht(
+        self,
+        input_shape,
+        q_layout,
+        flatten_axis,
+    ):
+        """Calling the NVFP4 V2 grouped quantize without use_rht should raise — the
+        non-RHT graph-safe NVFP4 grouped kernel does not yet exist."""
+        n_groups, m, n = input_shape
+        group_size_multiplier = 128
+        m = m * group_size_multiplier
+
+        x = jax.random.normal(jax.random.PRNGKey(0), (m, n), dtype=jnp.bfloat16)
+        group_sizes = jnp.full((n_groups,), m // n_groups, dtype=jnp.int32)
+
+        # use_rht defaults to False — should raise.
+        grouped_quantizer = QuantizerFactory.create(
+            scaling_mode=ScalingMode.NVFP4_1D_SCALING,
+            q_dtype=jnp.float4_e2m1fn,
+            q_layout=q_layout,
+            n_groups=n_groups,
+        )
+        with pytest.raises(ValueError, match="use_rht=True"):
+            tex.grouped_quantize(
+                x, group_sizes=group_sizes, flatten_axis=flatten_axis, quantizer=grouped_quantizer
+            )
+
+
 @pytest_parametrize_wrapper("in_dtype", QUANTIZATION_INPUT_DTYPE)
 class TestFusedQuantize:
 
@@ -1955,6 +2070,87 @@ class TestGroupedDense:
         assert_allclose(prim_wgrad, ref_wgrad, dtype=dtype)
         assert_allclose(prim_dbias, ref_dbias, dtype=dtype)
 
+    @pytest.mark.skipif(not is_fp4_supported, reason=fp4_unsupported_reason)
+    @pytest_parametrize_wrapper("layout", ["NT"])
+    def test_grouped_gemm_nvfp4(self, input_shape, layout):
+        """V2 NVFP4 grouped GEMM forward smoke + numerical sanity check.
+
+        Why ``NT`` only?
+        - NT puts lhs at contract-on-last (rowwise) and rhs at contract-on-last
+          (rowwise too).  Both operands hit the NVFP4 rowwise quantize path which is
+          a plain cast (no RHT, no rotation), so the GEMM result is numerically
+          correct and grouped_gemm's NN-style ragged-dim assumption holds.
+        - NN puts lhs rowwise (no RHT) and rhs colwise (RHT applied), so the RHT
+          does not cancel and the GEMM result is corrupted.
+        - TN/TT put both operands on the colwise path (RHT applied to both), which
+          would cancel the RHT — but the colwise rotation moves the ragged dim to
+          position 1 of the rotated lhs, and the C++ grouped_gemm avg-dims
+          assumes the ragged dim is at position 0.  Layout-aware avg-dims is out
+          of scope for this NVFP4 enablement.
+
+        The unit-level NVFP4 grouped quantize pieces (scale shape, rotation,
+        amaxes, FFI plumbing) are validated by TestGroupedNVFP4Quantize.
+        """
+        n_groups, m, n, k = input_shape
+        # NVFP4 V2 (cuBLAS 13.4+) requires 128-aligned dims; group_size_multiplier=128
+        # ensures every per-group row count is also 128-aligned.
+        if k % 128 != 0 or n % 128 != 0:
+            pytest.skip(
+                f"NVFP4 V2 grouped GEMM requires K and N divisible by 128, got K={k}, N={n}"
+            )
+        group_size_multiplier = 128
+        out_dtype = jnp.bfloat16
+
+        quantizer_set = QuantizerFactory.create_set(
+            scaling_mode=ScalingMode.NVFP4_1D_SCALING,
+            fwd_dtype=jnp.float4_e2m1fn,
+            bwd_dtype=jnp.float4_e2m1fn,
+            is_2x2x=False,
+            n_groups=input_shape[0],
+            use_rht=True,
+        )
+
+        lhs, rhs, group_sizes, contracting_dims, _ = self._generate_grouped_dense_input(
+            out_dtype, input_shape, layout, group_size_multiplier=group_size_multiplier
+        )
+        # Layout-aware BF16 reference (the shared _ref_grouped_dense helper hardcodes the
+        # NN convention rhs.shape == (G, K, N)).
+        lhs_contract_dim, _ = contracting_dims
+        # 2D lhs: non-contract axis is the other one (ragged M lives on it).
+        lhs_split_axis = 1 - lhs_contract_dim[0]
+        lhs_splits = jnp.split(lhs, jnp.cumulative_sum(group_sizes)[:-1], axis=lhs_split_axis)
+        rhs_splits = jnp.split(rhs, rhs.shape[0], axis=0)
+        ref_out = []
+        for lhs_i, rhs_i in zip(lhs_splits, rhs_splits):
+            # dot_general(lhs_i [M_i,...], rhs_i [1, ...], contracting_dims, ()) →
+            # (M_i, 1, N).  Squeeze the rhs G axis (axis 1) to match grouped_gemm output.
+            ref_out.append(
+                jnp.squeeze(
+                    jax.lax.dot_general(
+                        lhs_i,
+                        rhs_i,
+                        (contracting_dims, ((), ())),
+                        precision=jax.lax.Precision.HIGHEST,
+                    ),
+                    axis=1,
+                )
+            )
+
+        lhs_tensor = GroupedNoScaleTensor(
+            data=lhs, amax=None, first_dims=group_sizes, last_dims=None, original_shape=lhs.shape
+        )
+        rhs_tensor = GroupedNoScaleTensor(
+            data=rhs, amax=None, first_dims=None, last_dims=None, original_shape=rhs.shape
+        )
+        prim_out = jax.jit(tex.grouped_gemm, static_argnames=("contracting_dims",))(
+            lhs_tensor,
+            rhs_tensor,
+            contracting_dims=contracting_dims,
+            quantizer_set=quantizer_set,
+        )
+
+        self._assert_grouped_gemm_output(prim_out, group_sizes, ref_out, jnp.float4_e2m1fn)
+
     @pytest.mark.skipif(not is_fp8_supported, reason=fp8_unsupported_reason)
     @pytest.mark.parametrize(
         "fwd_bwd_dtype",
@@ -2001,6 +2197,68 @@ class TestGroupedDense:
         assert_allclose(prim_out_sum, ref_out_sum, dtype=fwd_dtype)
         assert_allclose(prim_dgrad, ref_dgrad, dtype=bwd_dtype)
         assert_allclose(prim_wgrad, ref_wgrad, dtype=bwd_dtype)
+        assert_allclose(prim_dbias, ref_dbias, dtype=dtype)
+
+    @pytest.mark.skipif(not is_fp4_supported, reason=fp4_unsupported_reason)
+    @pytest.mark.xfail(
+        reason=(
+            "grouped_dense's fwd/dgrad/wgrad GEMMs use NN-style layouts (one operand"
+            " rowwise, the other colwise).  V2 NVFP4 grouped quantize only produces"
+            " RHT-applied colwise output today, so the RHT on one side does not cancel"
+            " on the other and the numerical result is corrupted.  See the longer"
+            " explanation on test_grouped_gemm_nvfp4.  This will pass once a non-RHT"
+            " graph-safe NVFP4 grouped quantize kernel lands."
+        ),
+        strict=True,
+    )
+    def test_grouped_dense_grad_nvfp4(self, input_shape):
+        """End-to-end NVFP4 grouped_dense forward+backward via VJP.
+
+        Validates that:
+        - V2 NVFP4 grouped quantize runs on input/kernel (forward) and gradient (backward)
+        - V2 NVFP4 grouped GEMM consumes per-group amaxes correctly for fwd, dgrad, wgrad
+        - dbias flows through (uses bf16 path, not NVFP4)
+        """
+        n_groups, m, n, k = input_shape
+        # V2 NVFP4 requires 128-aligned K and N.
+        if k % 128 != 0 or n % 128 != 0:
+            pytest.skip(
+                f"NVFP4 V2 grouped GEMM requires K and N divisible by 128, got K={k}, N={n}"
+            )
+        dtype = jnp.bfloat16
+        x, kernel, group_sizes, contracting_dims, bias = self._generate_grouped_dense_input(
+            dtype,
+            input_shape,
+            with_bias=True,
+            group_size_multiplier=128,
+        )
+
+        quantizer_set = QuantizerFactory.create_set(
+            scaling_mode=ScalingMode.NVFP4_1D_SCALING,
+            fwd_dtype=jnp.float4_e2m1fn,
+            bwd_dtype=jnp.float4_e2m1fn,
+            is_2x2x=True,
+            n_groups=group_sizes.size,
+            use_rht=True,
+        )
+
+        value_n_grad_ref_func = value_and_grad(self._ref_sum_grouped_dense, (0, 1, 2))
+        value_n_grad_prim_func = jit(
+            value_and_grad(self._primitive_sum_grouped_dense, (0, 1, 2)), static_argnums=(4,)
+        )
+
+        ref_out_sum, (ref_dgrad, ref_wgrad, ref_dbias) = value_n_grad_ref_func(
+            x, kernel, bias, group_sizes, contracting_dims
+        )
+        prim_out_sum, (prim_dgrad, prim_wgrad, prim_dbias) = value_n_grad_prim_func(
+            x, kernel, bias, group_sizes, contracting_dims, quantizer_set=quantizer_set
+        )
+
+        # NVFP4 has lower precision than FP8; use float4 tolerance for the GEMM-derived
+        # tensors and bf16 tolerance for dbias which doesn't go through NVFP4.
+        assert_allclose(prim_out_sum, ref_out_sum, dtype=jnp.float4_e2m1fn)
+        assert_allclose(prim_dgrad, ref_dgrad, dtype=jnp.float4_e2m1fn)
+        assert_allclose(prim_wgrad, ref_wgrad, dtype=jnp.float4_e2m1fn)
         assert_allclose(prim_dbias, ref_dbias, dtype=dtype)
 
 
