@@ -20,6 +20,7 @@ from .cpp_extensions.amax import AmaxScope
 from .quantize import (
     ScaledTensor,
     QuantizerSet,
+    ScalingMode,
     noop_quantizer_set,
     with_sharding_constraint_by_logical_axes,
     TensorUsage,
@@ -547,3 +548,173 @@ def _grouped_dense_bwd_rule(
 
 
 _grouped_dense.defvjp(_grouped_dense_fwd_rule, _grouped_dense_bwd_rule)
+
+
+# ---------------------------------------------------------------------------
+# Batched dense (equal-size grouped GEMM with custom partitioning + Shardy)
+# ---------------------------------------------------------------------------
+
+
+def batched_dense(
+    x: jnp.ndarray,
+    kernel: jnp.ndarray,
+    dimension_numbers,
+    quantizer_set: QuantizerSet = noop_quantizer_set,
+    preferred_element_type: jnp.dtype = None,
+) -> jnp.ndarray:
+    """Batched dense (equal-size grouped GEMM) with quantization and proper SPMD.
+
+    Equivalent to ``jax.lax.dot_general(x, kernel, dimension_numbers)`` but uses TE's
+    grouped GEMM with equal group sizes under the hood, and supports MXFP8/NVFP4
+    quantization via ``quantizer_set``.  Unlike :func:`grouped_dense`, the underlying
+    primitive (:class:`BatchedGemmPrimitive`) implements custom partitioning + Shardy
+    rules so it works with ``shardy=True`` outside of ``shard_map``.
+
+    Args:
+        x: input tensor in batched layout (``B…, M…, K…``).
+        kernel: weight tensor in batched layout (``B…, K…, N…``).
+        dimension_numbers: ``((lhs_contract, rhs_contract), (lhs_batch, rhs_batch))``,
+            same shape as :class:`jax.lax.DotDimensionNumbers`.  At least one shared
+            batch dim is required.
+        quantizer_set: quantizer set used to derive scaling_mode + q_dtype.  Pass
+            :data:`noop_quantizer_set` for an unquantized BF16 GEMM.
+        preferred_element_type: output dtype (default: ``x.dtype``).
+
+    Returns:
+        Output tensor in batched layout ``(B…, M…, N…)``.
+    """
+    out_dtype = preferred_element_type or x.dtype
+
+    # Extract scaling_mode and q_dtype from the quantizer set (these are static and
+    # determine the path inside ``BatchedGemmPrimitive.impl``).
+    if quantizer_set.x is None:
+        scaling_mode = ScalingMode.NO_SCALING
+        q_dtype = None
+    else:
+        scaling_mode = quantizer_set.x.scaling_mode
+        q_dtype = quantizer_set.x.q_dtype
+
+    return _batched_dense(
+        x,
+        kernel,
+        dimension_numbers,
+        scaling_mode,
+        q_dtype,
+        out_dtype,
+    )
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(2, 3, 4, 5))
+def _batched_dense(x, kernel, dimension_numbers, scaling_mode, q_dtype, out_dtype):
+    out, _ = _batched_dense_fwd_rule(
+        x, kernel, dimension_numbers, scaling_mode, q_dtype, out_dtype
+    )
+    return out
+
+
+def _batched_dense_fwd_rule(x, kernel, dimension_numbers, scaling_mode, q_dtype, out_dtype):
+    out = tex.batched_gemm(
+        x,
+        kernel,
+        dimension_numbers=dimension_numbers,
+        scaling_mode=scaling_mode,
+        q_dtype=q_dtype,
+        preferred_element_type=out_dtype,
+    )
+    return out, (x, kernel)
+
+
+def _batched_dense_bwd_rule(dimension_numbers, scaling_mode, q_dtype, out_dtype, ctx, grad):
+    """Backward for batched_dense.
+
+    fwd: ``out = lhs · rhs``  with ``dimension_numbers = ((lhs_c, rhs_c), (lhs_b, rhs_b))``.
+        ``out`` has shape ``(batch, lhs_other, rhs_other)`` in that dim order.
+
+    dgrad: ``dlhs = grad · rhs^T``
+        - dgrad's lhs operand is ``grad`` (shape ``(batch, lhs_other, rhs_other)``)
+        - dgrad's rhs operand is ``rhs`` (original)
+        - contracts ``grad``'s rhs_other-dim region with ``rhs``'s rhs_other dims
+        - result has shape ``(batch, lhs_other, rhs_c)`` — needs a transpose to lhs's
+          natural dim order if dim positions in lhs's original layout aren't
+          ``batch < lhs_other < lhs_c``.
+
+    wgrad: ``drhs = lhs^T · grad``
+        - wgrad's lhs operand is original ``lhs`` (shape ``(B…, M…, K…)``)
+        - wgrad's rhs operand is ``grad`` (shape ``(batch, lhs_other, rhs_other)``)
+        - contracts ``lhs``'s lhs_other dims with ``grad``'s lhs_other-dim region
+        - result has shape ``(batch, lhs_c, rhs_other)`` — likewise may need transpose
+          to match rhs's natural dim order.
+    """
+    lhs, rhs = ctx
+    ((lhs_c, rhs_c), (lhs_b, rhs_b)) = dimension_numbers
+    lhs_ndim = len(lhs.shape)
+    rhs_ndim = len(rhs.shape)
+    lhs_other = tuple(d for d in range(lhs_ndim) if d not in lhs_b and d not in lhs_c)
+    rhs_other = tuple(d for d in range(rhs_ndim) if d not in rhs_b and d not in rhs_c)
+
+    nb = len(lhs_b)
+    nlo = len(lhs_other)
+    nro = len(rhs_other)
+    grad_batch_pos = tuple(range(nb))
+    grad_lhs_other_pos = tuple(range(nb, nb + nlo))
+    grad_rhs_other_pos = tuple(range(nb + nlo, nb + nlo + nro))
+
+    # ---- dgrad ----
+    dgrad_dn = (
+        (tuple(grad_rhs_other_pos), tuple(rhs_other)),
+        (tuple(grad_batch_pos), tuple(rhs_b)),
+    )
+    dlhs_raw = tex.batched_gemm(
+        grad,
+        rhs,
+        dimension_numbers=dgrad_dn,
+        scaling_mode=scaling_mode,
+        q_dtype=q_dtype,
+        preferred_element_type=out_dtype,
+    )
+    # dlhs_raw has dim order: (batch, lhs_other, rhs_c-as-dgrad-rhs-other).
+    # Transpose to lhs's natural dim order if needed.
+    dgrad_perm = []
+    for i in range(lhs_ndim):
+        if i in lhs_b:
+            dgrad_perm.append(lhs_b.index(i))
+        elif i in lhs_other:
+            dgrad_perm.append(nb + lhs_other.index(i))
+        else:  # i in lhs_c
+            dgrad_perm.append(nb + nlo + lhs_c.index(i))
+    if dgrad_perm != list(range(lhs_ndim)):
+        dlhs = jnp.transpose(dlhs_raw, dgrad_perm)
+    else:
+        dlhs = dlhs_raw
+
+    # ---- wgrad ----
+    wgrad_dn = (
+        (tuple(lhs_other), tuple(grad_lhs_other_pos)),
+        (tuple(lhs_b), tuple(grad_batch_pos)),
+    )
+    drhs_raw = tex.batched_gemm(
+        lhs,
+        grad,
+        dimension_numbers=wgrad_dn,
+        scaling_mode=scaling_mode,
+        q_dtype=q_dtype,
+        preferred_element_type=out_dtype,
+    )
+    # drhs_raw has dim order: (batch, lhs_c-as-wgrad-lhs-other, rhs_other-from-grad).
+    wgrad_perm = []
+    for i in range(rhs_ndim):
+        if i in rhs_b:
+            wgrad_perm.append(rhs_b.index(i))
+        elif i in rhs_c:
+            wgrad_perm.append(nb + rhs_c.index(i))
+        else:  # i in rhs_other
+            wgrad_perm.append(nb + len(rhs_c) + rhs_other.index(i))
+    if wgrad_perm != list(range(rhs_ndim)):
+        drhs = jnp.transpose(drhs_raw, wgrad_perm)
+    else:
+        drhs = drhs_raw
+
+    return dlhs, drhs
+
+
+_batched_dense.defvjp(_batched_dense_fwd_rule, _batched_dense_bwd_rule)

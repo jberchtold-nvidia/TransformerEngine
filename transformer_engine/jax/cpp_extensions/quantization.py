@@ -1383,6 +1383,7 @@ def _grouped_quantize_nvfp4(
     group_sizes: jnp.ndarray,
     ragged_first_dims: Optional[jnp.ndarray],
     flatten_axis: int,
+    bypass_outer_partitioning: bool = False,
 ) -> Union[ScaledTensor2x, GroupedScaledTensor1x]:
     """Grouped NVFP4 quantize via the V2 graph-safe RHT cast-fusion path.
 
@@ -1440,19 +1441,14 @@ def _grouped_quantize_nvfp4(
     hadamard_matrix = get_rht_matrix()
     random_sign_mask_t = get_sign_from_vector(get_wgrad_sign_vector())
 
-    (
-        rowwise_out,
-        colwise_out,
-        rowwise_scale_inv,
-        colwise_scale_inv,
-        rowwise_amax,
-        colwise_amax,
-    ) = GroupedQuantizePrimitive.outer_primitive.bind(
+    _bind_args = (
         x,
         jnp.ones((n_groups,), jnp.float32),  # scale (unused, matches V1 input arity)
         group_sizes,
         sr_rng_state,
         hadamard_matrix,
+    )
+    _bind_kwargs = dict(
         out_dtype=quantizer.q_dtype,
         scaling_mode=quantizer.scaling_mode.value,
         q_layout=quantizer.q_layout,
@@ -1461,6 +1457,24 @@ def _grouped_quantize_nvfp4(
         stochastic_rounding=stochastic_rounding,
         random_sign_mask_t=int(random_sign_mask_t),
     )
+    if bypass_outer_partitioning:
+        (
+            rowwise_out,
+            colwise_out,
+            rowwise_scale_inv,
+            colwise_scale_inv,
+            rowwise_amax,
+            colwise_amax,
+        ) = GroupedQuantizePrimitive.impl(*_bind_args, **_bind_kwargs)
+    else:
+        (
+            rowwise_out,
+            colwise_out,
+            rowwise_scale_inv,
+            colwise_scale_inv,
+            rowwise_amax,
+            colwise_amax,
+        ) = GroupedQuantizePrimitive.outer_primitive.bind(*_bind_args, **_bind_kwargs)
 
     # NVFP4 grouped quantize fuses the swizzle, so scales are already in the cuBLASLt
     # grouped GEMM swizzled layout (set_with_gemm_swizzled_scales(true) on the C++ side).
@@ -1491,6 +1505,7 @@ def grouped_quantize(
     quantizer: GroupedQuantizer,
     group_sizes: jnp.ndarray = None,
     flatten_axis: int = -1,
+    bypass_outer_partitioning: bool = False,
 ) -> Union[GroupedScaledTensor1x, GroupedNoScaleTensor]:
     """Quantize a tensor in grouped manner.
 
@@ -1539,7 +1554,8 @@ def grouped_quantize(
     # PyTorch's NVFP4 grouped quantize impl).  Dispatch to the dedicated primitive.
     if quantizer.scaling_mode == ScalingMode.NVFP4_1D_SCALING:
         return _grouped_quantize_nvfp4(
-            x, quantizer, group_sizes, ragged_first_dims, flatten_axis
+            x, quantizer, group_sizes, ragged_first_dims, flatten_axis,
+            bypass_outer_partitioning=bypass_outer_partitioning,
         )
 
     if not GroupedQuantizePrimitive.enabled():
@@ -1576,19 +1592,14 @@ def grouped_quantize(
     # branches on scaling_mode internally.
     empty_sr_rng_state = jnp.zeros((0,), dtype=jnp.uint32)
     empty_hadamard_matrix = jnp.zeros((0, 0), dtype=jnp.bfloat16)
-    (
-        rowwise_casted_output,
-        colwise_casted_output,
-        rowwise_scale_inv,
-        colwise_scale_inv,
-        updated_amax,
-        _colwise_amax_unused,
-    ) = GroupedQuantizePrimitive.outer_primitive.bind(
+    _bind_args = (
         x,
         scale,
         group_sizes,
         empty_sr_rng_state,
         empty_hadamard_matrix,
+    )
+    _bind_kwargs = dict(
         out_dtype=quantizer.q_dtype,
         scaling_mode=quantizer.scaling_mode.value,
         q_layout=q_layout,
@@ -1597,6 +1608,24 @@ def grouped_quantize(
         stochastic_rounding=False,
         random_sign_mask_t=0,
     )
+    if bypass_outer_partitioning:
+        (
+            rowwise_casted_output,
+            colwise_casted_output,
+            rowwise_scale_inv,
+            colwise_scale_inv,
+            updated_amax,
+            _colwise_amax_unused,
+        ) = GroupedQuantizePrimitive.impl(*_bind_args, **_bind_kwargs)
+    else:
+        (
+            rowwise_casted_output,
+            colwise_casted_output,
+            rowwise_scale_inv,
+            colwise_scale_inv,
+            updated_amax,
+            _colwise_amax_unused,
+        ) = GroupedQuantizePrimitive.outer_primitive.bind(*_bind_args, **_bind_kwargs)
 
     # For DelayedScaling2x and CurrentScaling2x, the scale buffer
     # is shared between rowwise and colwise

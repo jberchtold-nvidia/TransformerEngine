@@ -20,7 +20,7 @@ from transformer_engine.common.recipe import (
     MXFP8BlockScaling,
 )
 
-from ..dense import dense, grouped_dense
+from ..dense import dense, grouped_dense, batched_dense
 
 from ..layernorm import canonicalize_norm_type
 from ..layernorm import layernorm
@@ -1557,7 +1557,8 @@ def make_grouped_einsum_cls(quantization_recipe, quantization_checkpoint_name: O
             precision=None,
             preferred_element_type=None,
         ):
-            (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
+            del precision  # batched_dense doesn't expose a precision arg today
+            (lhs_contract, _), (lhs_batch, rhs_batch) = dimension_numbers
             assert len(lhs_batch) == len(rhs_batch) and len(lhs_batch) >= 1, (
                 "make_grouped_einsum_cls requires einsum patterns with at least one shared"
                 " batch dim between lhs and rhs (e.g. 'EBCM,EMH->EBCH'); got"
@@ -1566,52 +1567,28 @@ def make_grouped_einsum_cls(quantization_recipe, quantization_checkpoint_name: O
             lhs_other = tuple(
                 d for d in range(lhs.ndim) if d not in lhs_batch and d not in lhs_contract
             )
-            rhs_other = tuple(
-                d for d in range(rhs.ndim) if d not in rhs_batch and d not in rhs_contract
-            )
-            assert lhs_other and rhs_other, (
-                "make_grouped_einsum_cls requires the einsum to have non-empty 'M' (lhs-only)"
-                " and 'N' (rhs-only) axes for the grouped GEMM conversion."
+            assert lhs_other, (
+                "make_grouped_einsum_cls requires the einsum to have non-empty 'M'"
+                " (lhs-only non-contract non-batch) axes for the grouped GEMM conversion."
             )
 
             G = int(np.prod([lhs.shape[d] for d in lhs_batch]))
             M_per = int(np.prod([lhs.shape[d] for d in lhs_other]))
-            K = int(np.prod([lhs.shape[d] for d in lhs_contract]))
-            N = int(np.prod([rhs.shape[d] for d in rhs_other]))
-
             # MXFP8 / NVFP4 V2 grouped GEMM both require the ragged dim aligned to 128.
             assert M_per % 128 == 0, (
                 f"make_grouped_einsum_cls requires per-group M (={M_per}) divisible by 128 for"
                 f" MXFP8/NVFP4 grouped GEMM. dimension_numbers={dimension_numbers},"
-                f" lhs.shape={lhs.shape}, rhs.shape={rhs.shape}."
+                f" lhs.shape={lhs.shape}."
             )
-
-            x = jnp.transpose(
-                lhs, tuple(lhs_batch) + lhs_other + tuple(lhs_contract)
-            ).reshape(G * M_per, K)
-            kernel = jnp.transpose(
-                rhs, tuple(rhs_batch) + tuple(rhs_contract) + rhs_other
-            ).reshape(G, K, N)
-            group_sizes = jnp.full((G,), M_per, dtype=jnp.int32)
 
             quantizer_set = generate_quantizer_set(n_groups=G)
-
-            out = grouped_dense(
-                x,
-                kernel,
-                group_sizes=group_sizes,
-                contracting_dims=((1,), (1,)),
-                precision=precision if precision is not None else lax.Precision.DEFAULT,
-                preferred_element_type=preferred_element_type,
+            return batched_dense(
+                lhs,
+                rhs,
+                dimension_numbers=dimension_numbers,
                 quantizer_set=quantizer_set,
+                preferred_element_type=preferred_element_type,
             )
-
-            out_shape = (
-                tuple(lhs.shape[d] for d in lhs_batch)
-                + tuple(lhs.shape[d] for d in lhs_other)
-                + tuple(rhs.shape[d] for d in rhs_other)
-            )
-            return out.reshape(out_shape)
 
         return jnp.einsum(
             equation,

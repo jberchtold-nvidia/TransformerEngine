@@ -40,8 +40,10 @@ from ..quantize import (
     GroupedNoScaleTensor,
     ScalingMode,
     Quantizer,
+    QuantizerFactory,
     GroupedQuantizer,
     QuantizerSet,
+    TensorUsage,
     noop_quantizer_set,
     is_fp8_gemm_with_all_layouts_supported,
     apply_padding_to_scale_inv,
@@ -63,6 +65,7 @@ __all__ = [
     "gemm",
     "grouped_gemm_copy_group_sizes",
     "grouped_gemm",
+    "batched_gemm",
     "sanitize_dims",
     "get_non_contracting_dims",
     "transpose_dims",
@@ -1816,6 +1819,359 @@ class GroupedGemmPrimitive(BasePrimitive):
 register_primitive(GroupedGemmPrimitive)
 
 
+class BatchedGemmPrimitive(BasePrimitive):
+    """
+    Primitive for *batched* GEMM that internally calls grouped GEMM with equal-sized groups.
+
+    Unlike :class:`GroupedGemmPrimitive` (which supports ragged groups but does not expose
+    custom partitioning), this primitive exposes custom partitioning + Shardy rules
+    because the equal-size-batched case has well-defined sharding semantics: shared batch
+    dim(s) (per ``dimension_numbers``) map 1-1 across lhs/rhs/output, sharding the batch
+    dim across a mesh axis means each device runs its own local groups.
+
+    The primitive accepts *un-quantized* operands in their original batched layout. Inside
+    ``impl``, it:
+
+    1. Reshapes lhs ``(B…, M…, K…)`` to ``(G·M_per, K)`` and rhs ``(B…, K…, N…)`` to
+       ``(G, K, N)`` where G = product of batch dims.
+    2. Constructs transient :class:`GroupedQuantizer` objects (when ``scaling_mode`` is
+       MXFP8 or NVFP4) and calls :func:`grouped_quantize` with
+       ``bypass_outer_partitioning=True`` to keep nested calls outside of Shardy's view.
+    3. Calls :func:`grouped_gemm` with ``bypass_outer_partitioning=True``.
+    4. Reshapes the output ``(G·M_per, N)`` back to the batched layout.
+
+    Static args (after the 2 dynamic operand args ``lhs``, ``rhs``):
+        ``dimension_numbers``: ``((lhs_contract, rhs_contract), (lhs_batch, rhs_batch))``,
+            same shape as :class:`jax.lax.DotDimensionNumbers` but with at least one shared
+            batch dim required.
+        ``scaling_mode``: int value of :class:`ScalingMode` (NO_SCALING, MXFP8_1D_SCALING,
+            or NVFP4_1D_SCALING).
+        ``q_dtype``: quantization dtype (e.g. ``jnp.float8_e4m3fn``); ignored when
+            ``scaling_mode`` is NO_SCALING.
+        ``out_dtype``: output dtype.
+    """
+
+    name = "te_batched_gemm_wrapper"
+    multiple_results = False
+    # Dynamic args: lhs, rhs.  Static args follow.
+    impl_static_args = (2, 3, 4, 5)
+    inner_primitive = None
+    outer_primitive = None
+
+    @staticmethod
+    def _decompose(lhs_shape, rhs_shape, dimension_numbers):
+        """Returns: (lhs_other, rhs_other, G, M_per, K, N, out_shape, lhs_perm, rhs_perm)."""
+        ((lhs_contract, rhs_contract), (lhs_batch, rhs_batch)) = dimension_numbers
+        lhs_other = tuple(
+            d for d in range(len(lhs_shape)) if d not in lhs_batch and d not in lhs_contract
+        )
+        rhs_other = tuple(
+            d for d in range(len(rhs_shape)) if d not in rhs_batch and d not in rhs_contract
+        )
+        G = math.prod(lhs_shape[d] for d in lhs_batch)
+        M_per = math.prod(lhs_shape[d] for d in lhs_other)
+        K = math.prod(lhs_shape[d] for d in lhs_contract)
+        N = math.prod(rhs_shape[d] for d in rhs_other)
+        out_shape = (
+            tuple(lhs_shape[d] for d in lhs_batch)
+            + tuple(lhs_shape[d] for d in lhs_other)
+            + tuple(rhs_shape[d] for d in rhs_other)
+        )
+        lhs_perm = tuple(lhs_batch) + lhs_other + tuple(lhs_contract)
+        rhs_perm = tuple(rhs_batch) + tuple(rhs_contract) + rhs_other
+        return lhs_other, rhs_other, G, M_per, K, N, out_shape, lhs_perm, rhs_perm
+
+    @staticmethod
+    def abstract(lhs, rhs, dimension_numbers, scaling_mode, q_dtype, out_dtype):
+        del scaling_mode, q_dtype
+        _, _, _, _, _, _, out_shape, _, _ = BatchedGemmPrimitive._decompose(
+            lhs.shape, rhs.shape, dimension_numbers
+        )
+        return jax.core.ShapedArray(shape=out_shape, dtype=out_dtype)
+
+    @staticmethod
+    def lowering(*args, **kwargs):  # pragma: no cover - outer_only=True
+        raise NotImplementedError(
+            "BatchedGemmPrimitive is registered with outer_only=True; no inner lowering."
+        )
+
+    @staticmethod
+    def impl(lhs, rhs, dimension_numbers, scaling_mode, q_dtype, out_dtype):
+        scaling_mode = ScalingMode(scaling_mode)
+        _, _, G, M_per, K, N, out_shape, lhs_perm, rhs_perm = (
+            BatchedGemmPrimitive._decompose(lhs.shape, rhs.shape, dimension_numbers)
+        )
+
+        # Reshape from batched (B…, M…, K…) to grouped (G·M_per, K).
+        # Reshape from batched (B…, K…, N…) to grouped (G, K, N).
+        lhs_2d = jnp.transpose(lhs, lhs_perm).reshape(G * M_per, K)
+        rhs_3d = jnp.transpose(rhs, rhs_perm).reshape(G, K, N)
+        group_sizes = jnp.full((G,), M_per, dtype=jnp.int32)
+
+        if scaling_mode == ScalingMode.NO_SCALING:
+            lhs_grouped = GroupedNoScaleTensor(
+                data=lhs_2d,
+                amax=None,
+                first_dims=group_sizes,
+                last_dims=None,
+                original_shape=lhs_2d.shape,
+            )
+            rhs_grouped = GroupedNoScaleTensor(
+                data=rhs_3d,
+                amax=None,
+                first_dims=None,
+                last_dims=None,
+                original_shape=rhs_3d.shape,
+            )
+        else:
+            # Construct transient quantizers from scaling_mode + q_dtype.  Block-scaling
+            # quantizers (MXFP8 / NVFP4) have no Flax variables, so creating them inside
+            # `impl` is safe (no state escapes between calls).
+            lhs_quantizer = QuantizerFactory.create(
+                n_quantizers=1,
+                scaling_mode=scaling_mode,
+                q_dtype=q_dtype,
+                q_layout=QuantizeLayout.ROWWISE,
+                n_groups=G,
+            )
+            rhs_quantizer = QuantizerFactory.create(
+                n_quantizers=1,
+                scaling_mode=scaling_mode,
+                q_dtype=q_dtype,
+                q_layout=QuantizeLayout.COLWISE,  # cuBLAS FP8 grouped GEMM needs NT layout
+                n_groups=G,
+            )
+
+            casted_lhs = grouped_quantize(
+                lhs_2d, lhs_quantizer, group_sizes,
+                flatten_axis=-1, bypass_outer_partitioning=True,
+            )
+            casted_rhs = grouped_quantize(
+                rhs_3d, rhs_quantizer,
+                flatten_axis=-1, bypass_outer_partitioning=True,
+            )
+
+            lhs_grouped = casted_lhs.get_tensor(usage=TensorUsage.LHS)
+            rhs_grouped = casted_rhs.get_tensor(usage=TensorUsage.RHS)
+
+        out_2d = grouped_gemm(
+            lhs_grouped,
+            rhs_grouped,
+            contracting_dims=((1,), (1,)),
+            preferred_element_type=out_dtype,
+            bypass_outer_partitioning=True,
+        )
+        return out_2d.reshape(out_shape)
+
+    @staticmethod
+    def batcher(*args, **kwargs):  # pragma: no cover
+        raise NotImplementedError("vmap is not supported for BatchedGemmPrimitive")
+
+    @staticmethod
+    def _make_specs(arg_infos, dimension_numbers):
+        """Compute (lhs_specs, rhs_specs, out_specs, reduce_spec) PartitionSpec tuples.
+
+        Mirrors the partitioning rules in :class:`GemmPrimitive`, extended to recognize
+        batch dims (must be consistent between lhs and rhs).
+        """
+        ((lhs_contract, rhs_contract), (lhs_batch, rhs_batch)) = dimension_numbers
+
+        lhs_specs = list(get_padded_spec(arg_infos[0]))
+        rhs_specs = list(get_padded_spec(arg_infos[1]))
+
+        # Batch dims must agree on both operands; if mismatched we soft-resolve by
+        # preferring the rhs (kernel) sharding (Shardy will reshard lhs as needed).
+        for lb, rb in zip(lhs_batch, rhs_batch):
+            if lhs_specs[lb] != rhs_specs[rb]:
+                lhs_specs[lb] = rhs_specs[rb]
+
+        # reduce_spec: when both operands shard the contracting dim on the same mesh
+        # axis, the local GEMM produces partial results that need an all-reduce.
+        reduce_spec = None
+        for lc, rc in zip(lhs_contract, rhs_contract):
+            l, r = lhs_specs[lc], rhs_specs[rc]
+            if l is not None and l == r:
+                if reduce_spec is not None and reduce_spec != l:
+                    raise RuntimeError(
+                        "BatchedGemmPrimitive: multiple distinct reduce dims detected"
+                    )
+                reduce_spec = l
+
+        gsr = global_mesh_resource()
+
+        if reduce_spec is None:
+            for lc in lhs_contract:
+                lhs_specs[lc] = None
+            for rc in rhs_contract:
+                rhs_specs[rc] = None
+            # Mirror GemmPrimitive: unshard FSDP from rhs non-contract non-batch dims.
+            rhs_other = tuple(
+                d for d in range(len(rhs_specs)) if d not in rhs_batch and d not in rhs_contract
+            )
+            for d in rhs_other:
+                spec = rhs_specs[d]
+                if spec is not None and (
+                    spec == gsr.fsdp_resource
+                    or (isinstance(spec, tuple) and gsr.fsdp_resource in spec)
+                ):
+                    rhs_specs[d] = None
+        else:
+            for lc in lhs_contract:
+                lhs_specs[lc] = reduce_spec if lhs_specs[lc] == reduce_spec else None
+            for rc in rhs_contract:
+                rhs_specs[rc] = reduce_spec if rhs_specs[rc] == reduce_spec else None
+
+        # Drop lhs non-contract non-batch shardings that conflict with rhs non-contract.
+        lhs_other = tuple(
+            d for d in range(len(lhs_specs)) if d not in lhs_batch and d not in lhs_contract
+        )
+        rhs_other = tuple(
+            d for d in range(len(rhs_specs)) if d not in rhs_batch and d not in rhs_contract
+        )
+        rhs_other_specs = {rhs_specs[d] for d in rhs_other if rhs_specs[d] is not None}
+        for d in lhs_other:
+            if lhs_specs[d] in rhs_other_specs:
+                lhs_specs[d] = None
+
+        out_specs = (
+            tuple(lhs_specs[d] for d in lhs_batch)
+            + tuple(lhs_specs[d] for d in lhs_other)
+            + tuple(rhs_specs[d] for d in rhs_other)
+        )
+        return tuple(lhs_specs), tuple(rhs_specs), out_specs, reduce_spec
+
+    @staticmethod
+    def infer_sharding_from_operands(
+        dimension_numbers, scaling_mode, q_dtype, out_dtype, mesh, arg_infos, result_infos
+    ):
+        del scaling_mode, q_dtype, out_dtype, result_infos
+        _, _, out_specs, _ = BatchedGemmPrimitive._make_specs(arg_infos, dimension_numbers)
+        return NamedSharding(mesh, PartitionSpec(*out_specs))
+
+    @staticmethod
+    def partition(
+        dimension_numbers, scaling_mode, q_dtype, out_dtype, mesh, arg_infos, result_infos
+    ):
+        del result_infos
+        lhs_specs, rhs_specs, out_specs, reduce_spec = BatchedGemmPrimitive._make_specs(
+            arg_infos, dimension_numbers
+        )
+        arg_shardings = (
+            NamedSharding(mesh, PartitionSpec(*lhs_specs)),
+            NamedSharding(mesh, PartitionSpec(*rhs_specs)),
+        )
+        out_shardings = NamedSharding(mesh, PartitionSpec(*out_specs))
+
+        def _sharded_impl(lhs, rhs):
+            out = BatchedGemmPrimitive.impl(
+                lhs, rhs,
+                dimension_numbers=dimension_numbers,
+                scaling_mode=scaling_mode,
+                q_dtype=q_dtype,
+                out_dtype=out_dtype,
+            )
+            if reduce_spec is not None:
+                if is_all_reduce_in_float32():
+                    out = jax.lax.psum(out.astype(jnp.float32), reduce_spec).astype(out_dtype)
+                else:
+                    out = jax.lax.psum(out, reduce_spec)
+            return out
+
+        return mesh, _sharded_impl, out_shardings, arg_shardings
+
+    @staticmethod
+    def shardy_sharding_rule(
+        dimension_numbers, scaling_mode, q_dtype, out_dtype, mesh, operand_types, result_types
+    ):
+        del scaling_mode, q_dtype, out_dtype, mesh, result_types
+        ((lhs_contract, rhs_contract), (lhs_batch, rhs_batch)) = dimension_numbers
+        lhs, rhs = operand_types
+        lhs_ndim, rhs_ndim = len(lhs.shape), len(rhs.shape)
+
+        prefix = "BGemm_"
+        lhs_specs = [None] * lhs_ndim
+        rhs_specs = [None] * rhs_ndim
+        for i, d in enumerate(lhs_batch):
+            lhs_specs[d] = prefix + f"b{i}"
+        for i, d in enumerate(rhs_batch):
+            rhs_specs[d] = prefix + f"b{i}"
+        for i, d in enumerate(lhs_contract):
+            lhs_specs[d] = prefix + f"k{i}"
+        for i, d in enumerate(rhs_contract):
+            rhs_specs[d] = prefix + f"k{i}"
+        l_other_idx = 0
+        for d in range(lhs_ndim):
+            if lhs_specs[d] is None:
+                lhs_specs[d] = prefix + f"lhs_l{l_other_idx}"
+                l_other_idx += 1
+        r_other_idx = 0
+        for d in range(rhs_ndim):
+            if rhs_specs[d] is None:
+                rhs_specs[d] = prefix + f"rhs_l{r_other_idx}"
+                r_other_idx += 1
+
+        out_specs = []
+        for i in range(len(lhs_batch)):
+            out_specs.append(prefix + f"b{i}")
+        for i in range(l_other_idx):
+            out_specs.append(prefix + f"lhs_l{i}")
+        for i in range(r_other_idx):
+            out_specs.append(prefix + f"rhs_l{i}")
+
+        return SdyShardingRule(
+            operand_mappings=(tuple(lhs_specs), tuple(rhs_specs)),
+            result_mappings=(tuple(out_specs),),
+        )
+
+
+register_primitive(BatchedGemmPrimitive, outer_only=True)
+
+
+def batched_gemm(
+    lhs: jnp.ndarray,
+    rhs: jnp.ndarray,
+    dimension_numbers: Tuple[Tuple[Sequence[int], Sequence[int]], Tuple[Sequence[int], Sequence[int]]],
+    scaling_mode: ScalingMode = ScalingMode.NO_SCALING,
+    q_dtype: jnp.dtype = None,
+    preferred_element_type: jnp.dtype = None,
+) -> jnp.ndarray:
+    """Batched GEMM: ``jax.lax.dot_general``-shaped op that uses TE grouped GEMM with
+    equal-size groups under the hood, with optional MXFP8/NVFP4 quantization (handled
+    inside the primitive impl) and proper custom partitioning + Shardy rules.
+
+    The ``dimension_numbers`` follow :class:`jax.lax.DotDimensionNumbers`:
+    ``((lhs_contracting, rhs_contracting), (lhs_batch, rhs_batch))``. At least one shared
+    batch dim is required (it becomes the group axis).
+
+    Args:
+        lhs, rhs: input arrays in their natural batched layout.
+        dimension_numbers: contracting and batch dims (jax.lax.dot_general convention).
+        scaling_mode: ``ScalingMode.NO_SCALING`` (BF16), ``MXFP8_1D_SCALING``, or
+            ``NVFP4_1D_SCALING``.
+        q_dtype: quantization dtype (ignored if ``scaling_mode == NO_SCALING``).
+        preferred_element_type: output dtype (default: ``lhs.dtype``).
+
+    Returns:
+        Output array in batched layout: ``(B…, M…, N…)``.
+    """
+    out_dtype = preferred_element_type or lhs.dtype
+    ((lhs_c, rhs_c), (lhs_b, rhs_b)) = dimension_numbers
+    if not lhs_b:
+        raise ValueError(
+            "batched_gemm requires at least one shared batch dim in dimension_numbers."
+        )
+    dn = ((tuple(lhs_c), tuple(rhs_c)), (tuple(lhs_b), tuple(rhs_b)))
+    sm_value = scaling_mode.value if hasattr(scaling_mode, "value") else int(scaling_mode)
+
+    return BatchedGemmPrimitive.outer_primitive.bind(
+        lhs, rhs,
+        dimension_numbers=dn,
+        scaling_mode=sm_value,
+        q_dtype=q_dtype,
+        out_dtype=out_dtype,
+    )
+
+
 def _shape_normalization(x, dimension_numbers, already_transposed: bool = False):
     orig_order = list(range(x.ndim))
     contracting_dims, batch_dims = dimension_numbers
@@ -2421,6 +2777,7 @@ def grouped_gemm(
     group_offset: jnp.array = None,
     quantizer_set: QuantizerSet = noop_quantizer_set,
     use_async_d2h_group_sizes: bool = False,
+    bypass_outer_partitioning: bool = False,
 ) -> jnp.ndarray:
     """
     Grouped GEMM operation.
@@ -2614,7 +2971,7 @@ def grouped_gemm(
         additional_arg_2 = jnp.empty((0,), jnp.float32)  # unused
         additional_arg_3 = jnp.empty((0,), jnp.float32)  # unused
 
-    (out,) = GroupedGemmPrimitive.outer_primitive.bind(
+    bind_args = (
         lhs.data,
         lhs.scale_inv if isinstance(lhs, GroupedScaledTensor1x) else jnp.empty((0,), jnp.float32),
         rhs.data,
@@ -2630,6 +2987,8 @@ def grouped_gemm(
         additional_arg_1,
         additional_arg_2,
         additional_arg_3,
+    )
+    bind_kwargs = dict(
         lhs_is_trans=lhs_is_trans,
         rhs_is_trans=rhs_is_trans,
         scaling_mode=scaling_mode.value,
@@ -2645,4 +3004,14 @@ def grouped_gemm(
         rhs_left_size=int(rhs_left_size),
         rhs_right_size=int(rhs_right_size),
     )
+
+    if bypass_outer_partitioning:
+        # Skip the outer_primitive's custom_partitioning wrapper (and its Shardy rule)
+        # by calling impl() directly. impl() binds inner_primitive (which has FFI
+        # lowering only — no Shardy participation). Useful when this call is nested
+        # inside another primitive that is itself responsible for partitioning, like
+        # BatchedGemmPrimitive.
+        (out,) = GroupedGemmPrimitive.impl(*bind_args, **bind_kwargs)
+    else:
+        (out,) = GroupedGemmPrimitive.outer_primitive.bind(*bind_args, **bind_kwargs)
     return out
