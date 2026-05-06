@@ -1494,3 +1494,137 @@ def make_grouped_dense_cls(quantization_recipe, quantization_checkpoint_name: Op
         "ragged_dot",
         quantization_checkpoint_name=quantization_checkpoint_name,
     )()
+
+
+def make_grouped_einsum_cls(quantization_recipe, quantization_checkpoint_name: Optional[str] = None):
+    """Creates a Flax module instance with a `jnp.einsum`-shaped interface that
+    redirects each underlying `dot_general` to TE's grouped GEMM.
+
+    The wrapper accepts arbitrary einsum equations but is only meaningful for
+    batched-matmul patterns where lhs and rhs share at least one batch dim
+    (e.g. ``"EBCM,EMH -> EBCH"``). The shared batch dims become the group axis;
+    every group has the same size (we don't have a true batched GEMM yet —
+    equal-size grouped GEMM is slightly less efficient but good enough).
+
+    Quantizer state is managed through ``wrap_function_in_te_state_module``,
+    matching ``make_grouped_dense_cls``.
+
+    Args:
+        quantization_recipe: same constraints as ``make_grouped_dense_cls``
+            (``MXFP8BlockScaling``, ``NVFP4BlockScaling``, or ``None``).
+        quantization_checkpoint_name: forwarded to the wrapped module.
+
+    Returns:
+        A Flax module *instance* callable as ``module(equation, lhs, rhs, **kwargs)``.
+    """
+    from transformer_engine.common.recipe import NVFP4BlockScaling
+
+    if quantization_recipe is not None:
+        allowed_grouped_gemm_recipes = [MXFP8BlockScaling, NVFP4BlockScaling]
+        assert any(isinstance(quantization_recipe, r) for r in allowed_grouped_gemm_recipes), (
+            "Only the following quantization recipes are supported for grouped einsum or `None`"
+            f" for BF16 without quantization: {allowed_grouped_gemm_recipes}. Got"
+            f" {type(quantization_recipe)}."
+        )
+        if isinstance(quantization_recipe, NVFP4BlockScaling):
+            if getattr(quantization_recipe, "disable_rht", False):
+                raise ValueError(
+                    "NVFP4BlockScaling for grouped einsum requires disable_rht=False (the non-RHT"
+                    " graph-safe NVFP4 grouped quantize kernel is not yet implemented)."
+                )
+
+    def te_grouped_einsum(
+        generate_quantizer_set,
+        equation,
+        *operands,
+        precision=None,
+        preferred_element_type=None,
+        **kwargs,
+    ):
+        assert len(operands) == 2, (
+            "make_grouped_einsum_cls supports only 2-operand einsum equations; got"
+            f" {len(operands)} operands."
+        )
+
+        if isinstance(quantization_recipe, NVFP4BlockScaling):
+            # NVFP4 RHT requires inputs in bfloat16 (mirrors make_dot_general_cls).
+            operands = tuple(o.astype(jnp.bfloat16) for o in operands)
+
+        def grouped_dot_general(
+            lhs,
+            rhs,
+            dimension_numbers,
+            precision=None,
+            preferred_element_type=None,
+        ):
+            (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dimension_numbers
+            assert len(lhs_batch) == len(rhs_batch) and len(lhs_batch) >= 1, (
+                "make_grouped_einsum_cls requires einsum patterns with at least one shared"
+                " batch dim between lhs and rhs (e.g. 'EBCM,EMH->EBCH'); got"
+                f" dimension_numbers={dimension_numbers}."
+            )
+            lhs_other = tuple(
+                d for d in range(lhs.ndim) if d not in lhs_batch and d not in lhs_contract
+            )
+            rhs_other = tuple(
+                d for d in range(rhs.ndim) if d not in rhs_batch and d not in rhs_contract
+            )
+            assert lhs_other and rhs_other, (
+                "make_grouped_einsum_cls requires the einsum to have non-empty 'M' (lhs-only)"
+                " and 'N' (rhs-only) axes for the grouped GEMM conversion."
+            )
+
+            G = int(np.prod([lhs.shape[d] for d in lhs_batch]))
+            M_per = int(np.prod([lhs.shape[d] for d in lhs_other]))
+            K = int(np.prod([lhs.shape[d] for d in lhs_contract]))
+            N = int(np.prod([rhs.shape[d] for d in rhs_other]))
+
+            # MXFP8 / NVFP4 V2 grouped GEMM both require the ragged dim aligned to 128.
+            assert M_per % 128 == 0, (
+                f"make_grouped_einsum_cls requires per-group M (={M_per}) divisible by 128 for"
+                f" MXFP8/NVFP4 grouped GEMM. dimension_numbers={dimension_numbers},"
+                f" lhs.shape={lhs.shape}, rhs.shape={rhs.shape}."
+            )
+
+            x = jnp.transpose(
+                lhs, tuple(lhs_batch) + lhs_other + tuple(lhs_contract)
+            ).reshape(G * M_per, K)
+            kernel = jnp.transpose(
+                rhs, tuple(rhs_batch) + tuple(rhs_contract) + rhs_other
+            ).reshape(G, K, N)
+            group_sizes = jnp.full((G,), M_per, dtype=jnp.int32)
+
+            quantizer_set = generate_quantizer_set(n_groups=G)
+
+            out = grouped_dense(
+                x,
+                kernel,
+                group_sizes=group_sizes,
+                contracting_dims=((1,), (1,)),
+                precision=precision if precision is not None else lax.Precision.DEFAULT,
+                preferred_element_type=preferred_element_type,
+                quantizer_set=quantizer_set,
+            )
+
+            out_shape = (
+                tuple(lhs.shape[d] for d in lhs_batch)
+                + tuple(lhs.shape[d] for d in lhs_other)
+                + tuple(rhs.shape[d] for d in rhs_other)
+            )
+            return out.reshape(out_shape)
+
+        return jnp.einsum(
+            equation,
+            *operands,
+            precision=precision,
+            preferred_element_type=preferred_element_type,
+            _dot_general=grouped_dot_general,
+            **kwargs,
+        )
+
+    return wrap_function_in_te_state_module(
+        te_grouped_einsum,
+        quantization_recipe,
+        "grouped_einsum",
+        quantization_checkpoint_name=quantization_checkpoint_name,
+    )()

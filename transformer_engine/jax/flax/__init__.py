@@ -8,6 +8,7 @@ from .module import (
     wrap_function_in_te_state_module,
     make_dot_general_cls,
     make_grouped_dense_cls,
+    make_grouped_einsum_cls,
 )
 from .transformer import extend_logical_axis_rules
 from .transformer import DotProductAttention, MultiHeadAttention, RelativePositionBiases
@@ -21,6 +22,7 @@ __all__ = [
     "wrap_function_in_te_state_module",
     "make_dot_general_cls",
     "make_grouped_dense_cls",
+    "make_grouped_einsum_cls",
     "extend_logical_axis_rules",
     "DotProductAttention",
     "MultiHeadAttention",
