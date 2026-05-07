@@ -11,7 +11,9 @@
 #include "transformer_engine/cast.h"
 #include "transformer_engine/gemm.h"
 #include "transformer_engine/hadamard_transform.h"
+#include "transformer_engine/multi_tensor.h"
 #include "transformer_engine/recipe.h"
+#include "transformer_engine/swizzle.h"
 #include "transformer_engine/transformer_engine.h"
 #include "xla/ffi/api/c_api.h"
 
@@ -322,17 +324,19 @@ Error_Type GroupedQuantizeFFI(cudaStream_t stream, Buffer_Type inputs, Buffer_Ty
                               Result_Type colwise_scale_invs, Result_Type amaxs,
                               Result_Type colwise_amaxs_unused,
                               Result_Type quant_workspace_unused, Result_Type int64_workspace_unused,
-                              JAXX_Scaling_Mode scaling_mode,
+                              Result_Type scratch_compact_unused, JAXX_Scaling_Mode scaling_mode,
                               JAXX_Quantize_Layout quantize_layout, int64_t flatten_axis) {
   // sr_rng_state_unused / hadamard_matrix_unused exist so the V1 handler matches the
   // unified Python primitive's input arity (V2 NVFP4 needs them).
-  // colwise_amaxs_unused / quant_workspace_unused / int64_workspace_unused exist so that
-  // the V1 handler matches the unified abstract output count (V2 NVFP4 needs them).
+  // colwise_amaxs_unused / quant_workspace_unused / int64_workspace_unused /
+  // scratch_compact_unused exist so that the V1 handler matches the unified abstract
+  // output count (V2 NVFP4 no-RHT needs scratch_compact).
   (void)sr_rng_state_unused;
   (void)hadamard_matrix_unused;
   (void)colwise_amaxs_unused;
   (void)quant_workspace_unused;
   (void)int64_workspace_unused;
+  (void)scratch_compact_unused;
   NVTE_CHECK(scaling_mode != JAXX_Scaling_Mode::NO_SCALING,
              "Unsupported scaling mode: ", static_cast<int>(scaling_mode));
 
@@ -515,6 +519,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<Buffer_Type>()      // colwise amax (V2 NVFP4 only; unused here)
         .Ret<Buffer_Type>()      // quant_workspace (V2 NVFP4 only; unused here)
         .Ret<Buffer_Type>()      // int64_workspace (V2 only; unused here)
+        .Ret<Buffer_Type>()      // scratch_compact (V2 NVFP4 no-RHT only; unused here)
         .Attr<JAXX_Scaling_Mode>("scaling_mode")
         .Attr<JAXX_Quantize_Layout>("q_layout")
         .Attr<int64_t>("flatten_axis"));
@@ -557,7 +562,8 @@ Error_Type GroupedQuantizeV2FFI(cudaStream_t stream, Buffer_Type inputs, Buffer_
                                 Result_Type colwise_out, Result_Type rowwise_sinv,
                                 Result_Type colwise_sinv, Result_Type rowwise_amaxs,
                                 Result_Type colwise_amaxs, Result_Type quant_workspace,
-                                Result_Type int64_workspace, JAXX_Scaling_Mode scaling_mode,
+                                Result_Type int64_workspace, Result_Type scratch_compact,
+                                JAXX_Scaling_Mode scaling_mode,
                                 JAXX_Quantize_Layout quantize_layout, int64_t flatten_axis,
                                 bool stochastic_rounding, int64_t random_sign_mask_t) {
   (void)scale_unused;  // matches V1 input arity
@@ -618,6 +624,14 @@ Error_Type GroupedQuantizeV2FFI(cudaStream_t stream, Buffer_Type inputs, Buffer_
   data_shape.data[1] = n;
   data_shape.ndim = 2;
 
+  // Some downstream APIs (notably nvte_swizzle_grouped_scaling_factors via
+  // CheckInputGroupedTensor / CheckOutputGroupedTensor) assert data.shape.size()==1.
+  // The grouped quantize / RHT cast-fusion kernels index via logical_shape, not data.shape,
+  // so a flat 1D data shape works everywhere we set data on a GroupedTensor.
+  NVTEShape data_shape_1d{};
+  data_shape_1d.ndim = 1;
+  data_shape_1d.data[0] = m * n;
+
   NVTEShape sz_shape{};
   sz_shape.ndim = 1;
   sz_shape.data[0] = n_groups;
@@ -653,7 +667,7 @@ Error_Type GroupedQuantizeV2FFI(cudaStream_t stream, Buffer_Type inputs, Buffer_
     rw_sinv_shape.ndim = 2;
     rw_sinv_shape.data[0] = m;
     rw_sinv_shape.data[1] = n / block_size;
-    out_grouped.set_rowwise_data(rowwise_out->untyped_data(), out_dtype, data_shape)
+    out_grouped.set_rowwise_data(rowwise_out->untyped_data(), out_dtype, data_shape_1d)
         .set_rowwise_scale_inv(rowwise_sinv->untyped_data(), sinv_dtype, rw_sinv_shape);
     if (is_nvfp4) {
       out_grouped.set_amax(rowwise_amaxs->untyped_data(), DType::kFloat32, amax_shape);
@@ -666,7 +680,7 @@ Error_Type GroupedQuantizeV2FFI(cudaStream_t stream, Buffer_Type inputs, Buffer_
     cw_sinv_shape.ndim = 2;
     cw_sinv_shape.data[0] = m / block_size;
     cw_sinv_shape.data[1] = n;
-    out_grouped.set_columnwise_data(colwise_out->untyped_data(), out_dtype, data_shape)
+    out_grouped.set_columnwise_data(colwise_out->untyped_data(), out_dtype, data_shape_1d)
         .set_columnwise_scale_inv(colwise_sinv->untyped_data(), sinv_dtype, cw_sinv_shape);
     if (is_nvfp4) {
       out_grouped.set_columnwise_amax(colwise_amaxs->untyped_data(), DType::kFloat32, amax_shape);
@@ -695,9 +709,13 @@ Error_Type GroupedQuantizeV2FFI(cudaStream_t stream, Buffer_Type inputs, Buffer_
     return ffi_with_cuda_error_check();
   }
 
-  // NVFP4 graph-safe RHT path (mirrors PyTorch
-  // transformer_engine/pytorch/csrc/extensions/cast.cpp).  The non-RHT graph-safe NVFP4
-  // grouped kernel does not exist today.
+  // NVFP4 path.  Two implementations:
+  // 1) hadamard_matrix is provided (NVFP4 + RHT) → use the graph-safe RHT cast-fusion
+  //    pair (nvte_group_hadamard_transform_amax_graph_safe +
+  //    nvte_group_hadamard_transform_cast_fusion_graph_safe).
+  // 2) hadamard_matrix is empty (NVFP4 plain cast) → use the persistent grouped NVFP4
+  //    quantize kernel via nvte_group_quantize, the same dispatch entry point as
+  //    MXFP8.  This is the new path enabled by PR #2743.
   QuantizationConfigWrapper quant_config{};
   TensorWrapper sr_rng_state_tensor(sr_rng_state.untyped_data(), std::vector<size_t>{2},
                                     DType::kInt64);
@@ -709,14 +727,145 @@ Error_Type GroupedQuantizeV2FFI(cudaStream_t stream, Buffer_Type inputs, Buffer_
     quant_config.set_rng_state(sr_rng_state_tensor.data());
   }
 
-  // Step 1: compute per-group rowwise + post-RHT (colwise) amaxes.
-  // random_sign_mask=0 (no RHT applied to rowwise amax computation since rowwise output
-  // is plain cast); random_sign_mask_t drives the post-RHT amax direction for colwise.
+  const bool use_rht = hadamard_matrix.element_count() > 0;
+  if (!use_rht) {
+    // Persistent grouped NVFP4 quantize (no RHT).  Dispatches into
+    // group_quantize_fwd_helper → nvfp4::group_quantize_transpose (the new tuned 1D
+    // kernel from PR #2743).  Significantly faster than the RHT cast-fusion pair.
+    //
+    // The persistent kernel writes COMPACT scales (per-tensor stride = M *
+    // pad4(ceil(K/16)) for rowwise, K * pad4(ceil(M/16)) for colwise) and asserts
+    // !with_gemm_swizzled_scales.  The cuBLASLt grouped GEMM, however, expects the
+    // GEMM-swizzled scale layout.  We reconcile this by:
+    //   1) Building a `compact_grouped` tensor that points scale_inv at a JAX-allocated
+    //      compact scratch buffer (data buffers stay aimed at rowwise_out / colwise_out
+    //      so they're populated in place, no extra copy).
+    //   2) Calling nvte_group_quantize, which fills the scratch buffer with compact
+    //      scales and writes amaxes into the actual rowwise/colwise amax buffers.
+    //   3) Calling nvte_swizzle_grouped_scaling_factors to read the compact scales and
+    //      write GEMM-swizzled scales into rowwise_sinv / colwise_sinv (the actual
+    //      FFI result buffers).
+    GroupedTensorWrapper compact_grouped(n_groups, data_shape, get_nvte_scaling_mode(scaling_mode));
+    compact_grouped.set_first_dims(reinterpret_cast<void *>(int64_ptr), DType::kInt64, sz_shape)
+        .set_tensor_offsets(reinterpret_cast<void *>(offsets_ptr_out), DType::kInt64,
+                            offsets_shape);
+
+    // Slice the scratch buffer into compact rowwise + compact colwise scales (and a
+    // rowwise data scratch when q_layout is COLWISE-only). The persistent NVFP4 kernel
+    // ALWAYS writes rowwise data (NVTE_CHECK(output->has_data())); when the user only
+    // requested colwise data, we point compact_grouped's rowwise_data at the scratch
+    // tail. Offsets are keyed off the padded scale byte counts (upper bound on compact
+    // size) so they don't depend on per-group sizes — compatible with CUDA-graph capture.
+    uint8_t *scratch_base = reinterpret_cast<uint8_t *>(scratch_compact->untyped_data());
+    const size_t scratch_total_bytes = product(scratch_compact->dimensions());
+    const size_t rowwise_padded_bytes =
+        is_quantize_rowwise(quantize_layout) ? product(rowwise_sinv->dimensions()) : 0;
+    const size_t colwise_padded_bytes =
+        is_quantize_colwise(quantize_layout) ? product(colwise_sinv->dimensions()) : 0;
+
+    NVTEShape rw_sinv_shape{};
+    rw_sinv_shape.ndim = 2;
+    rw_sinv_shape.data[0] = m;
+    rw_sinv_shape.data[1] = n / block_size;
+    if (is_quantize_rowwise(quantize_layout)) {
+      compact_grouped.set_rowwise_data(rowwise_out->untyped_data(), out_dtype, data_shape_1d)
+          .set_rowwise_scale_inv(reinterpret_cast<void *>(scratch_base), sinv_dtype, rw_sinv_shape)
+          .set_amax(rowwise_amaxs->untyped_data(), DType::kFloat32, amax_shape);
+    } else {
+      // The persistent kernel still requires rowwise output to be allocated.  Carve out a
+      // tail region of the scratch buffer to receive m*n FP4 elements (m*n/2 bytes).
+      const size_t rowwise_data_bytes = (m * n + 1) / 2;
+      NVTE_CHECK(rowwise_padded_bytes + colwise_padded_bytes + rowwise_data_bytes <=
+                     scratch_total_bytes,
+                 "Compact scratch buffer is too small for NVFP4 rowwise data scratch.");
+      uint8_t *rowwise_data_scratch =
+          scratch_base + rowwise_padded_bytes + colwise_padded_bytes;
+      compact_grouped
+          .set_rowwise_data(reinterpret_cast<void *>(rowwise_data_scratch), out_dtype,
+                            data_shape_1d)
+          .set_rowwise_scale_inv(reinterpret_cast<void *>(scratch_base), sinv_dtype, rw_sinv_shape)
+          .set_amax(rowwise_amaxs->untyped_data(), DType::kFloat32, amax_shape);
+    }
+    if (is_quantize_colwise(quantize_layout)) {
+      NVTEShape cw_sinv_shape{};
+      cw_sinv_shape.ndim = 2;
+      cw_sinv_shape.data[0] = m / block_size;
+      cw_sinv_shape.data[1] = n;
+      NVTE_CHECK(rowwise_padded_bytes + colwise_padded_bytes <= scratch_total_bytes,
+                 "Compact scratch buffer is too small for NVFP4 colwise scales.");
+      compact_grouped.set_columnwise_data(colwise_out->untyped_data(), out_dtype, data_shape_1d)
+          .set_columnwise_scale_inv(reinterpret_cast<void *>(scratch_base + rowwise_padded_bytes),
+                                    sinv_dtype, cw_sinv_shape)
+          .set_columnwise_amax(colwise_amaxs->untyped_data(), DType::kFloat32, amax_shape);
+    }
+    // Persistent kernel asserts !with_gemm_swizzled_scales.
+    compact_grouped.set_with_gemm_swizzled_scales(false);
+
+    // The persistent NVFP4 grouped quantize kernel READS per-tensor amax from
+    // input->amax / input->columnwise_amax (group_quantize_transpose_nvfp4_tuned_1D.cuh:887)
+    // — it does not compute amax internally.  We must compute amax first.  We use
+    // nvte_group_amax_graph_safe (graph-safe, no D2H), which writes per-tensor amax to
+    // output->amax / output->columnwise_amax (whichever directions output->has_data()
+    // and output->has_columnwise_data() report).  out_grouped already has both data and
+    // amax buffers configured above (lines 656-678) for the directions q_layout requests,
+    // so the call writes only the amaxes we'll actually need.
+    nvte_group_amax_graph_safe(in_grouped.data(), out_grouped.data(), stream);
+
+    // Wire those amax buffers in as INPUT to the persistent kernel.
+    if (is_quantize_rowwise(quantize_layout)) {
+      in_grouped.set_amax(rowwise_amaxs->untyped_data(), DType::kFloat32, amax_shape);
+    }
+    if (is_quantize_colwise(quantize_layout)) {
+      in_grouped.set_columnwise_amax(colwise_amaxs->untyped_data(), DType::kFloat32, amax_shape);
+    } else if (!is_quantize_rowwise(quantize_layout)) {
+      // q_layout is colwise-only: the persistent kernel still does a rowwise pass into
+      // the scratch (we discard it); without rowwise amax it falls back to S_enc=1.0
+      // (group_quantize_transpose_nvfp4_tuned_1D.cuh:583-585), which is harmless because
+      // the rowwise output is never read.
+    }
+
+    nvte_group_quantize(in_grouped.data(), compact_grouped.data(), quant_config, stream);
+
+    // Swizzle: we only want to swizzle the directions the user actually requested.
+    // The persistent kernel always writes rowwise scale_inv (even when the user wanted
+    // colwise-only — we point it at a scratch buffer above).  swizzle_in is a separate
+    // GroupedTensorWrapper that mirrors compact_grouped but only carries the scale_inv
+    // buffers for directions the user requested, so the swizzle won't try to write
+    // rowwise scales into the JAX-side dummy (1,) buffer.
+    GroupedTensorWrapper swizzle_in(n_groups, data_shape,
+                                    get_nvte_scaling_mode(scaling_mode));
+    swizzle_in.set_first_dims(reinterpret_cast<void *>(int64_ptr), DType::kInt64, sz_shape)
+        .set_tensor_offsets(reinterpret_cast<void *>(offsets_ptr_out), DType::kInt64,
+                            offsets_shape)
+        .set_with_gemm_swizzled_scales(false);
+    // Point data fields at the same buffers as compact_grouped so swizzle's
+    // CheckInputGroupedTensor (which requires has_data() || has_columnwise_data()) passes.
+    // The swizzle implementation itself never reads data — only scale_inv.
+    if (is_quantize_rowwise(quantize_layout)) {
+      swizzle_in.set_rowwise_data(rowwise_out->untyped_data(), out_dtype, data_shape_1d)
+          .set_rowwise_scale_inv(reinterpret_cast<void *>(scratch_base), sinv_dtype,
+                                 rw_sinv_shape);
+    }
+    if (is_quantize_colwise(quantize_layout)) {
+      NVTEShape cw_sinv_shape{};
+      cw_sinv_shape.ndim = 2;
+      cw_sinv_shape.data[0] = m / block_size;
+      cw_sinv_shape.data[1] = n;
+      swizzle_in.set_columnwise_data(colwise_out->untyped_data(), out_dtype, data_shape_1d)
+          .set_columnwise_scale_inv(
+              reinterpret_cast<void *>(scratch_base + rowwise_padded_bytes), sinv_dtype,
+              cw_sinv_shape);
+    }
+    nvte_swizzle_grouped_scaling_factors(swizzle_in.data(), out_grouped.data(), stream);
+    return ffi_with_cuda_error_check();
+  }
+
+  // RHT path: compute per-group rowwise + post-RHT (colwise) amaxes, then cast-fuse
+  // rowwise (plain) + colwise (RHT + cast) in one fused pass.
   nvte_group_hadamard_transform_amax_graph_safe(in_grouped.data(), out_grouped.data(),
                                                 /*random_sign_mask=*/0,
                                                 static_cast<int>(random_sign_mask_t), stream);
 
-  // Step 2: cast (rowwise) + RHT cast fusion (colwise) in one fused pass.
   NVTE_CHECK(convert_ffi_datatype_to_te_dtype(hadamard_matrix.element_type()) == DType::kBFloat16,
              "Hadamard matrix must be bf16.");
   NVTE_CHECK(hadamard_matrix.dimensions().size() == 2 && hadamard_matrix.dimensions()[0] == 16 &&
@@ -753,6 +902,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(GroupedQuantizeV2Handler, GroupedQuantizeV2FFI,
                                   .Ret<Buffer_Type>()      // colwise_amaxs (NVFP4; empty for MXFP8)
                                   .Ret<Buffer_Type>()      // quant_workspace (NVFP4; empty for MXFP8)
                                   .Ret<Buffer_Type>()      // int64_workspace
+                                  .Ret<Buffer_Type>()  // scratch_compact (NVFP4 no-RHT V2; dummy otherwise)
                                   .Attr<JAXX_Scaling_Mode>("scaling_mode")
                                   .Attr<JAXX_Quantize_Layout>("q_layout")
                                   .Attr<int64_t>("flatten_axis")

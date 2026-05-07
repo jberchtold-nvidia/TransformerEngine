@@ -1463,16 +1463,9 @@ def make_grouped_dense_cls(quantization_recipe, quantization_checkpoint_name: Op
             f" BF16 without quantization: {allowed_grouped_gemm_recipes}. Got"
             f" {type(quantization_recipe)}."
         )
-        if isinstance(quantization_recipe, NVFP4BlockScaling):
-            # The NVFP4 grouped quantize V2 path is implemented only for the RHT graph-safe
-            # cast-fusion kernel — the non-RHT graph-safe NVFP4 grouped quantize kernel does
-            # not exist today.  Mirrors the PyTorch behaviour
-            # (transformer_engine/pytorch/csrc/extensions/cast.cpp).
-            if getattr(quantization_recipe, "disable_rht", False):
-                raise ValueError(
-                    "NVFP4BlockScaling for grouped GEMM requires disable_rht=False (the non-RHT"
-                    " graph-safe NVFP4 grouped quantize kernel is not yet implemented)."
-                )
+        # Both disable_rht=False (RHT cast-fusion) and disable_rht=True (persistent
+        # NVFP4 grouped quantize from PR #2743 + nvte_swizzle_grouped_scaling_factors)
+        # are now supported by the V2 grouped quantize FFI.
 
     def te_grouped_dot_general(generate_quantizer_set, x, kernel, group_sizes, **kwargs):
         del kwargs  # Unused

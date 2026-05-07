@@ -238,6 +238,55 @@ get_tensor_cols_num(const size_t tensor_id, const size_t last_logical_dim,
   }
 }
 
+// Runtime-dispatch overloads.  These accept ``shape_rep`` as a runtime argument and
+// switch over its value to call the appropriate compile-time-templated specialization
+// above.  Used by call sites whose enclosing kernel was not (yet) templated on
+// ShapeRepresentation — e.g. the MXFP8 group dequantize path in
+// cast/mxfp8/group_dequantize_mxfp8.cuh.  Restored here after PR #2743's refactor
+// removed them; updating every such call site to be SHAPE_REP-templated is a
+// follow-up cleanup.
+__device__ __forceinline__ size_t
+get_tensor_rows_num(const size_t tensor_id, const ShapeRepresentation shape_rep,
+                    const size_t first_logical_dim,
+                    const int64_t *const __restrict__ first_dims_ptr, const size_t num_tensors) {
+  switch (shape_rep) {
+    case ShapeRepresentation::SAME_BOTH_DIMS:
+      return get_tensor_rows_num<ShapeRepresentation::SAME_BOTH_DIMS>(
+          tensor_id, first_logical_dim, first_dims_ptr, num_tensors);
+    case ShapeRepresentation::VARYING_FIRST_DIM:
+      return get_tensor_rows_num<ShapeRepresentation::VARYING_FIRST_DIM>(
+          tensor_id, first_logical_dim, first_dims_ptr, num_tensors);
+    case ShapeRepresentation::VARYING_LAST_DIM:
+      return get_tensor_rows_num<ShapeRepresentation::VARYING_LAST_DIM>(
+          tensor_id, first_logical_dim, first_dims_ptr, num_tensors);
+    case ShapeRepresentation::VARYING_BOTH_DIMS:
+      return get_tensor_rows_num<ShapeRepresentation::VARYING_BOTH_DIMS>(
+          tensor_id, first_logical_dim, first_dims_ptr, num_tensors);
+  }
+  return 0;
+}
+
+__device__ __forceinline__ size_t
+get_tensor_cols_num(const size_t tensor_id, const ShapeRepresentation shape_rep,
+                    const size_t last_logical_dim,
+                    const int64_t *const __restrict__ last_dims_ptr) {
+  switch (shape_rep) {
+    case ShapeRepresentation::SAME_BOTH_DIMS:
+      return get_tensor_cols_num<ShapeRepresentation::SAME_BOTH_DIMS>(
+          tensor_id, last_logical_dim, last_dims_ptr);
+    case ShapeRepresentation::VARYING_FIRST_DIM:
+      return get_tensor_cols_num<ShapeRepresentation::VARYING_FIRST_DIM>(
+          tensor_id, last_logical_dim, last_dims_ptr);
+    case ShapeRepresentation::VARYING_LAST_DIM:
+      return get_tensor_cols_num<ShapeRepresentation::VARYING_LAST_DIM>(
+          tensor_id, last_logical_dim, last_dims_ptr);
+    case ShapeRepresentation::VARYING_BOTH_DIMS:
+      return get_tensor_cols_num<ShapeRepresentation::VARYING_BOTH_DIMS>(
+          tensor_id, last_logical_dim, last_dims_ptr);
+  }
+  return 0;
+}
+
 template <ShapeRepresentation SHAPE_REP>
 __device__ __forceinline__ size_t get_tensor_base_offset(
     const size_t tensor_id, const size_t first_logical_dim, const size_t last_logical_dim,

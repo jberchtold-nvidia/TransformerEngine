@@ -1227,6 +1227,42 @@ class GroupedQuantizePrimitive(BasePrimitive):
             colwise_amax_aval = jax.core.ShapedArray(shape=(1,), dtype=jnp.float32)
             quant_workspace_aval = jax.core.ShapedArray(shape=(1,), dtype=jnp.uint8)
 
+        # NVFP4 V2 path needs a compact-scale scratch buffer: the persistent grouped
+        # NVFP4 quantize kernel writes scales in compact (per-tensor unpadded-M)
+        # layout, and the FFI then runs nvte_swizzle_grouped_scaling_factors to
+        # produce the GEMM-swizzled scales the cuBLASLt grouped GEMM consumes.  We
+        # size this conservatively as the byte count of the padded rowwise +
+        # padded colwise scale buffers (compact <= padded).
+        #
+        # The persistent kernel ALWAYS writes rowwise output (its NVTE_CHECK requires
+        # output->has_data()).  When q_layout is COLWISE-only, JAX doesn't allocate a
+        # rowwise output buffer, so we extend the scratch to hold m*n/2 bytes of
+        # rowwise FP4 data scratch (FP4 is 0.5 bytes per element).
+        # For MXFP8 and other paths the scratch is a dummy (1,) buffer.
+        if is_nvfp4 and use_v2:
+            rowwise_scale_inv_bytes = math.prod(rowwise_scale_inv_aval.shape) * jnp.dtype(
+                rowwise_scale_inv_aval.dtype
+            ).itemsize
+            colwise_scale_inv_bytes = math.prod(colwise_scale_inv_aval.shape) * jnp.dtype(
+                colwise_scale_inv_aval.dtype
+            ).itemsize
+            extra_rowwise_data_bytes = 0
+            if not q_layout.has_rowwise:
+                # FP4 = 0.5 bytes/elt.  out_shape = m*n.
+                extra_rowwise_data_bytes = (out_shape + 1) // 2
+            scratch_compact_aval = jax.core.ShapedArray(
+                shape=(
+                    int(
+                        rowwise_scale_inv_bytes
+                        + colwise_scale_inv_bytes
+                        + extra_rowwise_data_bytes
+                    ),
+                ),
+                dtype=jnp.uint8,
+            )
+        else:
+            scratch_compact_aval = jax.core.ShapedArray(shape=(1,), dtype=jnp.uint8)
+
         return (
             rowwise_out_aval,
             colwise_out_aval,
@@ -1236,6 +1272,7 @@ class GroupedQuantizePrimitive(BasePrimitive):
             colwise_amax_aval,
             quant_workspace_aval,
             int64_workspace_aval,
+            scratch_compact_aval,
         )
 
     @staticmethod
@@ -1252,6 +1289,7 @@ class GroupedQuantizePrimitive(BasePrimitive):
             colwise_amax_aval,
             _,  # quant_workspace
             _,  # int64_workspace
+            _,  # scratch_compact
         ) = GroupedQuantizePrimitive.abstract(*args, **kwargs)
         return (
             rowwise_out_aval,
@@ -1348,8 +1386,9 @@ class GroupedQuantizePrimitive(BasePrimitive):
             colwise_scale_inv,
             rowwise_amax,
             colwise_amax,
-            _,
-            _,
+            _,  # quant_workspace
+            _,  # int64_workspace
+            _,  # scratch_compact (NVFP4 V2 only)
         ) = GroupedQuantizePrimitive.inner_primitive.bind(
             x,
             scale,
@@ -1384,10 +1423,12 @@ def _grouped_quantize_nvfp4(
     ragged_first_dims: Optional[jnp.ndarray],
     flatten_axis: int,
 ) -> Union[ScaledTensor2x, GroupedScaledTensor1x]:
-    """Grouped NVFP4 quantize via the V2 graph-safe RHT cast-fusion path.
+    """Grouped NVFP4 quantize via the V2 graph-safe path.
 
-    Requires `use_rht=True` on the underlying NVFP4Quantizer (mirrors PyTorch behavior;
-    the non-RHT graph-safe NVFP4 grouped kernel does not exist today).
+    When ``use_rht=True`` on the per-group NVFP4Quantizer, dispatches to the RHT
+    cast-fusion graph-safe pair.  When ``use_rht=False``, dispatches to the persistent
+    grouped NVFP4 quantize kernel (PR #2743) followed by ``nvte_swizzle_grouped_scaling_factors``
+    so the FFI's output scales are always GEMM-swizzled regardless of path.
     """
     assert quantizer.scaling_mode == ScalingMode.NVFP4_1D_SCALING, (
         f"_grouped_quantize_nvfp4 expects NVFP4_1D_SCALING quantizer, got"
@@ -1397,11 +1438,7 @@ def _grouped_quantize_nvfp4(
     # Each per-group quantizer in the GroupedQuantizer is an NVFP4Quantizer.  We pull the
     # RHT / SR settings from the first one (they're identical across the group).
     sub_q = quantizer.quantizers[0]
-    if not getattr(sub_q, "use_rht", False):
-        raise ValueError(
-            "Grouped NVFP4 quantize currently requires use_rht=True on the NVFP4Quantizer"
-            " (the non-RHT graph-safe grouped kernel does not exist yet)."
-        )
+    use_rht = bool(getattr(sub_q, "use_rht", False))
 
     if not GroupedQuantizePrimitive.enabled():
         # No graph-safe NVFP4 V2 kernel available: fall back to the per-tensor pure-JAX
@@ -1437,8 +1474,14 @@ def _grouped_quantize_nvfp4(
         sr_rng_state = jnp.zeros((4,), dtype=jnp.uint32)
         stochastic_rounding = False
 
-    hadamard_matrix = get_rht_matrix()
-    random_sign_mask_t = get_sign_from_vector(get_wgrad_sign_vector())
+    # The hadamard_matrix buffer doubles as a "use RHT" signal to the C++ FFI:
+    # element_count() > 0 → RHT cast-fusion path; empty → persistent kernel + swizzle path.
+    if use_rht:
+        hadamard_matrix = get_rht_matrix()
+        random_sign_mask_t = int(get_sign_from_vector(get_wgrad_sign_vector()))
+    else:
+        hadamard_matrix = jnp.zeros((0, 0), dtype=jnp.bfloat16)
+        random_sign_mask_t = 0
 
     (
         rowwise_out,
@@ -1459,11 +1502,12 @@ def _grouped_quantize_nvfp4(
         flatten_axis=flatten_axis,
         scale_dtype=quantizer.get_scale_dtype(),
         stochastic_rounding=stochastic_rounding,
-        random_sign_mask_t=int(random_sign_mask_t),
+        random_sign_mask_t=random_sign_mask_t,
     )
 
-    # NVFP4 grouped quantize fuses the swizzle, so scales are already in the cuBLASLt
-    # grouped GEMM swizzled layout (set_with_gemm_swizzled_scales(true) on the C++ side).
+    # The C++ FFI emits already-swizzled scales for both the RHT cast-fusion path and the
+    # persistent + swizzle path.  Only the colwise pass went through RHT (rowwise is plain
+    # cast in both cases).
     out = ScaledTensorFactory.create(
         data=rowwise_out,
         scale_inv=rowwise_scale_inv,
@@ -1478,9 +1522,8 @@ def _grouped_quantize_nvfp4(
         flatten_axis=flatten_axis,
         first_dims=ragged_first_dims,
         original_shape=original_shape,
-        # Colwise output went through RHT; rowwise did not.
         rowwise_has_rht_applied=False,
-        colwise_has_rht_applied=True,
+        colwise_has_rht_applied=use_rht,
         pre_swizzled=True,
     )
     return out
