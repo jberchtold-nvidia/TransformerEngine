@@ -1194,6 +1194,18 @@ class GroupedQuantizePrimitive(BasePrimitive):
         rowwise_amax_aval = jax.core.ShapedArray(shape=(n_groups,), dtype=jnp.float32)
 
         use_v2 = GroupedQuantizePrimitive._use_v2_kernel(scaling_mode, x_aval.shape, flatten_axis)
+        # The graph-safe NVFP4 grouped Hadamard transform kernels have a hard cap of 64
+        # groups per kernel launch (kMaxTensorsPerKernel in
+        # common/hadamard_transform/{graph_safe_group_row_cast_col_hadamard_transform_cast_fusion,
+        # group_hadamard_transform}.cu).  Surface it at trace time with an actionable error
+        # instead of letting the CUDA NVTE_CHECK fire mid-step.
+        if is_nvfp4 and use_v2 and n_groups > 64:
+            raise ValueError(
+                "GroupedQuantizePrimitive (V2, NVFP4_1D_SCALING) requires num_groups <= 64"
+                " (kMaxTensorsPerKernel of the graph-safe grouped Hadamard transform"
+                f" kernels), but got num_groups={n_groups}. For MoE this means"
+                " expert_parallelism must be large enough that local_experts_per_rank <= 64."
+            )
         if use_v2:
             # V2 path: int64_workspace laid out as:
             #   [n_groups int64 group_sizes | n_groups+1 int64 offsets]
