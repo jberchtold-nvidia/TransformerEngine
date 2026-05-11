@@ -47,7 +47,12 @@ from ..quantize import (
     apply_padding_to_scale_inv,
     QuantizeLayout,
 )
-from .misc import get_padded_spec, is_all_reduce_in_float32, get_min_device_compute_capability
+from .misc import (
+    get_padded_spec,
+    is_all_reduce_in_float32,
+    get_min_device_compute_capability,
+    get_int_env_flag,
+)
 from ..sharding import (
     global_mesh_resource,
     tpsp_axis_size,
@@ -1469,13 +1474,6 @@ class GroupedGemmPrimitive(BasePrimitive):
     """
 
     name = "te_grouped_gemm_ffi"
-    # args = lhs_data, lhs_scale_inv, rhs_data, rhs_scale_inv, bias,
-    #        lhs_first_dims, lhs_last_dims, rhs_first_dims, rhs_last_dims,
-    #        out_first_dims, out_last_dims,
-    #        additional_arg_0 (alpha for V2, group_offset for V1),
-    #        additional_arg_1 (beta for V2, unused for V1),
-    #        additional_arg_2 (lhs_amax for V2 NVFP4, empty otherwise),
-    #        additional_arg_3 (rhs_amax for V2 NVFP4, empty otherwise)
     name_graph_safe = "te_grouped_gemm_v2_ffi"
     multiple_results = True
     impl_static_args = (15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28)
@@ -2098,16 +2096,8 @@ def grouped_gemm_copy_group_sizes(
     return out
 
 
-@cache
 def _should_enforce_v2_grouped_gemm() -> bool:
-    """Read NVTE_JAX_ENFORCE_V2_GROUPED_GEMM once per process (cached)."""
-    val = os.getenv("NVTE_JAX_ENFORCE_V2_GROUPED_GEMM", "0")
-    try:
-        return bool(int(val))
-    except ValueError as e:
-        raise ValueError(
-            f"NVTE_JAX_ENFORCE_V2_GROUPED_GEMM must be an integer (0 or 1), got: {val!r}"
-        ) from e
+    return get_int_env_flag("NVTE_JAX_ENFORCE_V2_GROUPED_GEMM")
 
 
 def _is_v2_grouped_gemm_supported(
@@ -2148,61 +2138,31 @@ def _is_v2_grouped_gemm_supported(
         return True, ""
 
     if scaling_mode in (ScalingMode.MXFP8_1D_SCALING, ScalingMode.NVFP4_1D_SCALING):
-        # V2 MXFP8 / NVFP4 require 128-aligned dimensions for the V2 grouped GEMM setup
-        # kernel to compute scale offsets correctly across groups.  Individual group sizes
-        # must also be 128-aligned (dynamic constraint).
+        # 128-alignment is required so the V2 setup kernel computes scale offsets
+        # correctly; block scales are padded to multiples of (128, 4) and overlapping
+        # reads from the prior group would produce silently wrong results.
         mode_name = "MXFP8" if scaling_mode == ScalingMode.MXFP8_1D_SCALING else "NVFP4"
-        if lhs_shape is not None and lhs_axis_boundary is not None:
-            lhs_first_dim = math.prod(lhs_shape[:lhs_axis_boundary])
-            if lhs_first_dim % 128 != 0:
-                return (
-                    False,
-                    (
-                        f"The TE V2 grouped GEMM for {mode_name} requires the product of the first"
-                        " dimensions (up to axis_boundary) of LHS to be divisible by 128, but got"
-                        f" {lhs_first_dim} with lhs_shape={lhs_shape} and"
-                        f" lhs_axis_boundary={lhs_axis_boundary}."
-                    ),
-                )
-        if rhs_shape is not None and rhs_axis_boundary is not None:
-            rhs_first_dim = math.prod(rhs_shape[:rhs_axis_boundary])
-            if rhs_first_dim % 128 != 0:
-                return (
-                    False,
-                    (
-                        f"The TE V2 grouped GEMM for {mode_name} requires the product of the first"
-                        " dimensions (up to axis_boundary) of RHS to be divisible by 128, but got"
-                        f" {rhs_first_dim} with rhs_shape={rhs_shape} and"
-                        f" rhs_axis_boundary={rhs_axis_boundary}."
-                    ),
-                )
 
-        # V2 MXFP8/NVFP4 also requires that the "last" dimension (after axis_boundary) of both
-        # operands is a multiple of 128. This is because block scales must be padded to a multiple of (128, 4). The nvte_grouped_gemm setup kernels only handle the case when this dim is a multiple of 128 as well. If it is not, the GEMM setup kernel will not compute the scale offsets correctly and will read overlapping scales from the previous group, causing incorrect results.
-        if lhs_shape is not None and lhs_axis_boundary is not None:
-            lhs_last_dim = math.prod(lhs_shape[lhs_axis_boundary:])
-            if lhs_last_dim % 128 != 0:
-                return (
-                    False,
-                    (
-                        f"The TE V2 grouped GEMM for {mode_name} requires the product of the last"
-                        " dimensions (after axis_boundary) of LHS to be divisible by 128, but got"
-                        f" {lhs_last_dim} with lhs_shape={lhs_shape} and"
-                        f" lhs_axis_boundary={lhs_axis_boundary}."
-                    ),
-                )
-        if rhs_shape is not None and rhs_axis_boundary is not None:
-            rhs_last_dim = math.prod(rhs_shape[rhs_axis_boundary:])
-            if rhs_last_dim % 128 != 0:
-                return (
-                    False,
-                    (
-                        f"The TE V2 grouped GEMM for {mode_name} requires the product of the last"
-                        " dimensions (after axis_boundary) of RHS to be divisible by 128, but got"
-                        f" {rhs_last_dim} with rhs_shape={rhs_shape} and"
-                        f" rhs_axis_boundary={rhs_axis_boundary}."
-                    ),
-                )
+        def _check_128_aligned(side, shape, axis, slot):
+            if shape is None or axis is None:
+                return None
+            section = shape[:axis] if slot == "first" else shape[axis:]
+            value = math.prod(section)
+            if value % 128 == 0:
+                return None
+            return (
+                f"The TE V2 grouped GEMM for {mode_name} requires the product of the"
+                f" {slot} dimensions ({'up to' if slot == 'first' else 'after'} axis_boundary)"
+                f" of {side} to be divisible by 128, but got {value} with {side.lower()}_shape={shape}"
+                f" and {side.lower()}_axis_boundary={axis}."
+            )
+
+        for side, shape, axis in (("LHS", lhs_shape, lhs_axis_boundary),
+                                  ("RHS", rhs_shape, rhs_axis_boundary)):
+            for slot in ("first", "last"):
+                msg = _check_128_aligned(side, shape, axis, slot)
+                if msg is not None:
+                    return False, msg
         return True, ""
 
     return (
@@ -2495,13 +2455,8 @@ def grouped_gemm(
             "Ensure lhs or rhs tensor objects carry first_dims or last_dims."
         )
 
-    # Pre-compute collapsed 2D sizes from original N-D shapes.
-    # These are static Python ints passed as primitive parameters (must be hashable).
-    # Use the LOGICAL (pre-rotation) shape: NVFP4 colwise tensors get their
-    # original_shape rotated by ScaledTensorFactory.create_1x to mirror the
-    # transposed-quantized data layout, but the cuBLASLt grouped GEMM expects un-
-    # rotated dims (it switches to colwise + swap_dims internally based on the
-    # un-remapped is_trans flag).
+    # See _grouped_logical_shape: cuBLASLt expects the un-rotated dims, even though
+    # ScaledTensor stores the post-rotation shape for NVFP4 colwise.
     lhs_logical_shape = _grouped_logical_shape(lhs)
     rhs_logical_shape = _grouped_logical_shape(rhs)
     lhs_left_size = math.prod(lhs_logical_shape[:lhs_axis_boundary])
@@ -2601,8 +2556,8 @@ def grouped_gemm(
                 )
             additional_arg_0 = jnp.ones((num_gemms,), jnp.float32)  # alpha
             additional_arg_1 = jnp.zeros((num_gemms,), jnp.float32)  # beta
-            additional_arg_2 = lhs_amax.astype(jnp.float32)
-            additional_arg_3 = rhs_amax.astype(jnp.float32)
+            additional_arg_2 = lhs_amax
+            additional_arg_3 = rhs_amax
         else:
             additional_arg_0 = jnp.ones((num_gemms,), jnp.float32)  # alpha
             additional_arg_1 = jnp.zeros((num_gemms,), jnp.float32)  # beta

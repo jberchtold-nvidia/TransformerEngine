@@ -3,8 +3,7 @@
 # See LICENSE for license information.
 """JAX/TE custom ops for quantization"""
 import operator
-import os
-from functools import cache, reduce
+from functools import reduce
 from typing import Tuple, Optional, Union
 import math
 
@@ -27,6 +26,7 @@ from .misc import (
     multidim_transpose,
     should_apply_1x_fused_dbias_war_for_arch_l_100,
     get_min_device_compute_capability,
+    get_int_env_flag,
     NamedSharding,
 )
 from ..sharding import (
@@ -991,48 +991,24 @@ def quantize_dbias(
     )
 
 
-@cache
 def _should_enforce_v2_grouped_quantize() -> bool:
-    """Read ``NVTE_JAX_ENFORCE_V2_GROUPED_QUANTIZE`` once per process (cached).
-
-    Mirrors ``_should_enforce_v2_grouped_gemm`` in cpp_extensions/gemm.py.  When set,
-    callers that would otherwise silently fall back to V1 grouped quantize raise a
-    RuntimeError instead — useful for verifying that the V2 kernel is actually being
-    used in a given workload.
-    """
-    val = os.getenv("NVTE_JAX_ENFORCE_V2_GROUPED_QUANTIZE", "0")
-    try:
-        return bool(int(val))
-    except ValueError as e:
-        raise ValueError(
-            "NVTE_JAX_ENFORCE_V2_GROUPED_QUANTIZE must be an integer (0 or 1), got:"
-            f" {val!r}"
-        ) from e
+    return get_int_env_flag("NVTE_JAX_ENFORCE_V2_GROUPED_QUANTIZE")
 
 
 class GroupedQuantizePrimitive(BasePrimitive):
-    """
-    Cast Primitive wrapping nvte_quantize and nvte_quantize_dbias.
+    """Cast Primitive wrapping nvte_quantize and nvte_quantize_dbias.
 
-    Supports two backend kernels:
-
-    - V1 ``te_grouped_quantize_ffi`` — per-tensor multi-tensor quantize, host-aware
-      (D2H copies group_sizes), supports all scaling modes.  Used as a fallback when
-      ``_use_v2_kernel`` returns False.
-
-    - V2 ``te_grouped_quantize_v2_ffi`` — graph-safe path.  Handles MXFP8_1D_SCALING via
-      ``nvte_group_quantize`` and NVFP4_1D_SCALING via the graph-safe RHT cast-fusion
-      (mirrors the PyTorch impl; the non-RHT graph-safe NVFP4 grouped kernel does not
-      exist today).  ``sr_rng_state`` and ``hadamard_matrix`` are NVFP4-only inputs;
-      callers pass empty buffers for the MXFP8 case.
+    V1 (``te_grouped_quantize_ffi``) supports all scaling modes but is not CUDA-graph
+    safe (D2H copies group_sizes).  V2 (``te_grouped_quantize_v2_ffi``) is graph-safe
+    and supports MXFP8_1D_SCALING and NVFP4_1D_SCALING; callers fall back to V1 when
+    V2 prerequisites aren't met.  ``sr_rng_state`` and ``hadamard_matrix`` are
+    NVFP4-only — pass empty buffers for MXFP8.
     """
 
-    name = "te_grouped_quantize_ffi"  # V1: fallback path (supports all shapes, not CUDA-graph safe)
-    name_v2 = "te_grouped_quantize_v2_ffi"  # V2: MXFP8 + NVFP4, CUDA-graph safe
+    name = "te_grouped_quantize_ffi"
+    name_v2 = "te_grouped_quantize_v2_ffi"
     multiple_results = True
     impl_static_args = (
-        # Positional args 0-4: x, scale, group_sizes, sr_rng_state, hadamard_matrix.
-        # Static kwargs follow.
         5,  # out_dtype
         6,  # scaling_mode
         7,  # q_layout
@@ -1048,20 +1024,8 @@ class GroupedQuantizePrimitive(BasePrimitive):
     def _is_v2_supported(scaling_mode, x_shape, flatten_axis) -> Tuple[bool, str]:
         """Return ``(supported, reason)`` for whether the V2 grouped quantize can be used.
 
-        Two V2 paths are supported:
-
-        - MXFP8_1D_SCALING:  uses nvte_group_quantize (fused swizzle).  Requires SM100+
-          and 128-aligned shape dims (block size 32 → V2 GEMM also requires 128-aligned
-          K/N).
-        - NVFP4_1D_SCALING:  uses the graph-safe RHT path
-          (nvte_group_hadamard_transform_amax_graph_safe +
-          nvte_group_hadamard_transform_cast_fusion_graph_safe).  Mirrors the PyTorch
-          impl; the non-RHT graph-safe NVFP4 grouped kernel does not exist today.
-          NVFP4 block size is 16, but the V2 grouped GEMM still requires 128-aligned
-          dims, so we keep the 128-alignment constraints to ensure GEMM compatibility.
-
-        Falls back to V1 when constraints are not met. V1 supports arbitrary shapes
-        but performs a D2H copy of group_sizes (not CUDA-graph safe).
+        128-alignment is enforced even for NVFP4 (block size 16) because the
+        downstream V2 grouped GEMM requires it.
         """
         sm = ScalingMode(scaling_mode)
         if sm not in (ScalingMode.MXFP8_1D_SCALING, ScalingMode.NVFP4_1D_SCALING):
@@ -1126,8 +1090,7 @@ class GroupedQuantizePrimitive(BasePrimitive):
         """Return True when the V2 (CUDA-graph-safe) grouped quantize kernel can be used.
 
         When ``NVTE_JAX_ENFORCE_V2_GROUPED_QUANTIZE=1``, an unsupported configuration
-        raises ``RuntimeError`` instead of silently falling back to V1.  Mirrors
-        ``is_v2_grouped_gemm_supported`` in cpp_extensions/gemm.py.
+        raises ``RuntimeError`` instead of silently falling back to V1.
         """
         is_v2_supported, reason = GroupedQuantizePrimitive._is_v2_supported(
             scaling_mode, x_shape, flatten_axis
@@ -1232,11 +1195,13 @@ class GroupedQuantizePrimitive(BasePrimitive):
 
         # NVFP4-only outputs: colwise_amax (per-group post-RHT) and quant_workspace (tile
         # scheduler workspace, >= 4 bytes).  For MXFP8 / V1 these are dummy (1,) buffers.
-        if is_nvfp4 and use_v2:
+        if is_nvfp4 and use_v2 and q_layout.has_colwise:
             colwise_amax_aval = jax.core.ShapedArray(shape=(n_groups,), dtype=jnp.float32)
-            quant_workspace_aval = jax.core.ShapedArray(shape=(4,), dtype=jnp.uint8)
         else:
             colwise_amax_aval = jax.core.ShapedArray(shape=(1,), dtype=jnp.float32)
+        if is_nvfp4 and use_v2:
+            quant_workspace_aval = jax.core.ShapedArray(shape=(4,), dtype=jnp.uint8)
+        else:
             quant_workspace_aval = jax.core.ShapedArray(shape=(1,), dtype=jnp.uint8)
 
         return (
@@ -1301,9 +1266,6 @@ class GroupedQuantizePrimitive(BasePrimitive):
         assert group_sizes_aval.dtype == jnp.int32
         use_v2 = GroupedQuantizePrimitive._use_v2_kernel(scaling_mode, x_aval.shape, flatten_axis)
         if use_v2:
-            # V2: CUDA-graph safe.  scale, sr_rng_state, hadamard_matrix may be empty
-            # buffers depending on scaling_mode (sr_rng_state and hadamard_matrix are
-            # NVFP4-only).
             return ffi.ffi_lowering(GroupedQuantizePrimitive.name_v2)(
                 ctx,
                 x,
@@ -1317,11 +1279,8 @@ class GroupedQuantizePrimitive(BasePrimitive):
                 stochastic_rounding=stochastic_rounding,
                 random_sign_mask_t=random_sign_mask_t,
             )
-        # V1: supports arbitrary shapes but not CUDA-graph safe (performs D2H copy of group_sizes).
-        # Used for non-MXFP8 scaling modes and for MXFP8 when total_first_dim % 128 != 0.
-        # The V1 handler accepts (and ignores) sr_rng_state / hadamard_matrix /
-        # stochastic_rounding / random_sign_mask_t so the FFI signature matches the unified
-        # Python primitive.
+        # V1 ignores sr_rng_state / hadamard_matrix / stochastic_rounding /
+        # random_sign_mask_t — the FFI signature is unified across V1 and V2.
         return ffi.ffi_lowering(GroupedQuantizePrimitive.name)(
             ctx,
             x,
@@ -1398,16 +1357,13 @@ def _grouped_quantize_nvfp4(
 ) -> Union[ScaledTensor2x, GroupedScaledTensor1x]:
     """Grouped NVFP4 quantize via the V2 graph-safe RHT cast-fusion path.
 
-    Requires `use_rht=True` on the underlying NVFP4Quantizer (mirrors PyTorch behavior;
-    the non-RHT graph-safe NVFP4 grouped kernel does not exist today).
+    Requires ``use_rht=True`` on the underlying NVFP4Quantizer.
     """
     assert quantizer.scaling_mode == ScalingMode.NVFP4_1D_SCALING, (
         f"_grouped_quantize_nvfp4 expects NVFP4_1D_SCALING quantizer, got"
         f" {quantizer.scaling_mode}"
     )
 
-    # Each per-group quantizer in the GroupedQuantizer is an NVFP4Quantizer.  We pull the
-    # RHT / SR settings from the first one (they're identical across the group).
     sub_q = quantizer.quantizers[0]
     if not getattr(sub_q, "use_rht", False):
         raise ValueError(
@@ -1416,8 +1372,6 @@ def _grouped_quantize_nvfp4(
         )
 
     if not GroupedQuantizePrimitive.enabled():
-        # No graph-safe NVFP4 V2 kernel available: fall back to the per-tensor pure-JAX
-        # quantize path supplied by the quantizer itself.
         return quantizer.quantize(x, flatten_axis=flatten_axis, group_sizes=group_sizes)
 
     if not GroupedQuantizePrimitive._use_v2_kernel(
@@ -1440,8 +1394,8 @@ def _grouped_quantize_nvfp4(
     n_groups = group_sizes.size
     original_shape = x.shape
 
-    # SR rng state: 16 bytes total, the C++ side reinterprets as int64[2].  We pass a
-    # uint32[4] (= 16 bytes) to avoid jnp.int64 truncation under jax_enable_x64=False.
+    # SR rng state: pass a uint32[4] (= 16 bytes, what the C++ side reinterprets as
+    # int64[2]) to avoid jnp.int64 truncation under jax_enable_x64=False.
     if sub_q.stochastic_rounding_rng_state is not None:
         sr_rng_state = sub_q.stochastic_rounding_rng_state[0, :4].astype(jnp.uint32)
         stochastic_rounding = True
@@ -1474,8 +1428,6 @@ def _grouped_quantize_nvfp4(
         random_sign_mask_t=int(random_sign_mask_t),
     )
 
-    # NVFP4 grouped quantize fuses the swizzle, so scales are already in the cuBLASLt
-    # grouped GEMM swizzled layout (set_with_gemm_swizzled_scales(true) on the C++ side).
     out = ScaledTensorFactory.create(
         data=rowwise_out,
         scale_inv=rowwise_scale_inv,
@@ -1547,8 +1499,6 @@ def grouped_quantize(
     if group_sizes is None:
         group_sizes = jnp.ones(x.shape[0], dtype=jnp.int32)
 
-    # NVFP4 grouped quantize: only the V2 graph-safe RHT path is supported (mirrors
-    # PyTorch's NVFP4 grouped quantize impl).  Dispatch to the dedicated primitive.
     if quantizer.scaling_mode == ScalingMode.NVFP4_1D_SCALING:
         return _grouped_quantize_nvfp4(
             x, quantizer, group_sizes, ragged_first_dims, flatten_axis

@@ -2,15 +2,19 @@
 #
 # See LICENSE for license information.
 """Randomized Hadamard Transform (RHT) utilities for JAX."""
+from functools import cache
+
 import jax.numpy as jnp
 
 
-def get_wgrad_sign_vector() -> list[int]:
+@cache
+def get_wgrad_sign_vector() -> tuple[int, ...]:
     """Get a fixed sign vector for the RHT used in NVFP4 weight gradient quantization."""
-    return [1, 1, 1, -1, 1, -1, -1, -1, -1, -1, -1, 1, -1, 1, -1, -1]
+    return (1, 1, 1, -1, 1, -1, -1, -1, -1, -1, -1, 1, -1, 1, -1, -1)
 
 
-def get_sign_from_vector(vector: list[int]) -> int:
+@cache
+def get_sign_from_vector(vector: tuple[int, ...]) -> int:
     """Convert a sign vector to a bitmask integer."""
     mask = 0
     for i, v in enumerate(vector):
@@ -28,19 +32,23 @@ def apply_rht(x: jnp.ndarray, inverse=False) -> jnp.ndarray:
     return (x.reshape(-1, block_size) @ h).reshape(x.shape)
 
 
+@cache
+def _get_rht_matrix_numpy():
+    """Build the RHT matrix as a NumPy array (cache-safe — no JAX tracers)."""
+    import numpy as np
+    import scipy
+
+    block_size = 16
+    h = scipy.linalg.hadamard(block_size).astype(np.float32)
+    s = np.asarray(get_wgrad_sign_vector(), dtype=np.int32)
+    h = np.diag(s) @ h
+    return h / np.sqrt(block_size)
+
+
 def get_rht_matrix() -> jnp.ndarray:
     """Get the Randomized Hadamard Transform (RHT) matrix used in NVFP4 weight gradient quantization.
 
     Returns:
         A (16, 16) bfloat16 matrix representing the RHT. This matrix is pre-multiplied by the random sign mask.
     """
-    import scipy
-
-    block_size = 16
-    h = jnp.array(scipy.linalg.hadamard(block_size))
-
-    # Apply the random sign mask
-    s = jnp.array(get_wgrad_sign_vector(), dtype=jnp.int32)
-    h = jnp.diag(s) @ h
-
-    return (h / jnp.sqrt(block_size)).astype(jnp.bfloat16)
+    return jnp.asarray(_get_rht_matrix_numpy(), dtype=jnp.bfloat16)

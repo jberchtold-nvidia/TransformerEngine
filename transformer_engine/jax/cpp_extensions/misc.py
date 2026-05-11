@@ -294,3 +294,13 @@ def is_all_reduce_in_float32():
     Check if all-reduce is in float32
     """
     return os.getenv("NVTE_JAX_ALL_REDUCE_IN_FP32", "0") == "1"
+
+
+@functools.cache
+def get_int_env_flag(name: str, default: str = "0") -> bool:
+    """Read an integer (0/1) environment variable as a bool, raising on bad input."""
+    val = os.getenv(name, default)
+    try:
+        return bool(int(val))
+    except ValueError as e:
+        raise ValueError(f"{name} must be an integer (0 or 1), got: {val!r}") from e

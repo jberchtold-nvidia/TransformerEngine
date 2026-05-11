@@ -770,15 +770,15 @@ JAXX_GroupedTensorWrapper make_grouped_tensor(
   const bool is_mxfp8 = scaling_mode == JAXX_Scaling_Mode::MXFP8_1D_SCALING;
   const bool is_nvfp4 = scaling_mode == JAXX_Scaling_Mode::NVFP4_1D_SCALING ||
                         scaling_mode == JAXX_Scaling_Mode::NVFP4_2D_SCALING;
-  if ((is_mxfp8 || is_nvfp4) && use_colwise) {
-    wrapper.set_columnwise(data, scale_inv);
-  } else if (is_mxfp8 || is_nvfp4) {
-    wrapper.set_rowwise(data, scale_inv);
-  } else {
-    // NO_SCALING: no scale_inv needed
+  const bool needs_scaled_inputs = is_mxfp8 || is_nvfp4;
+  if (!needs_scaled_inputs) {
     wrapper.set_rowwise(data, std::nullopt);
+  } else if (use_colwise) {
+    wrapper.set_columnwise(data, scale_inv);
+  } else {
+    wrapper.set_rowwise(data, scale_inv);
   }
-  if (is_mxfp8 || is_nvfp4) {
+  if (needs_scaled_inputs) {
     wrapper.set_with_gemm_swizzled_scales(true);
   }
   if (is_nvfp4) {

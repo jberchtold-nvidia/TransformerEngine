@@ -519,38 +519,10 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<JAXX_Quantize_Layout>("q_layout")
         .Attr<int64_t>("flatten_axis"));
 
-// V2 grouped quantize. Handles MXFP8 (nvte_group_quantize) and NVFP4
-// (nvte_group_hadamard_transform_*_graph_safe) in a single FFI handler.  Branches on the
-// `scaling_mode` attribute.  Buffers that don't apply to the active mode (e.g.
-// hadamard_matrix for MXFP8, colwise_amaxs for MXFP8) must still be passed but may be
-// empty.
-//
-// Inputs:
-//   inputs           : packed float input (BF16/FP16/FP32), shape derived from flatten_axis
-//   scale_unused     : ignored (matches V1 input arity)
-//   group_sizes      : (G,) int32 group sizes on device
-//   sr_rng_state     : (4,) uint32 / (2,) int64 stochastic-rounding state.  Only consumed
-//                      when scaling_mode=NVFP4_1D_SCALING and stochastic_rounding=true.
-//                      May be empty for MXFP8.
-//   hadamard_matrix  : (16, 16) bf16 Hadamard matrix.  Only consumed when scaling_mode=
-//                      NVFP4_1D_SCALING.  May be empty for MXFP8.
-//
-// Outputs:
-//   rowwise_out      : packed quantized data, rowwise (cast only for NVFP4)
-//   colwise_out      : packed quantized data, colwise (RHT + cast for NVFP4)
-//   rowwise_sinv     : block scales for rowwise data (E8M0 for MXFP8 / E4M3 for NVFP4)
-//   colwise_sinv     : block scales for colwise data
-//   rowwise_amaxs    : (G,) float32 — populated for NVFP4, dummy for MXFP8
-//   colwise_amaxs    : (G,) float32 — populated for NVFP4, may be empty for MXFP8
-//   quant_workspace  : tile-scheduler workspace (>= 4 bytes for NVFP4, may be empty for MXFP8)
-//   int64_workspace  : (2*G+1)*8 bytes (group_sizes + offsets)
-//
-// Attrs:
-//   scaling_mode        : MXFP8_1D_SCALING or NVFP4_1D_SCALING
-//   q_layout            : ROWWISE / COLWISE / ROWWISE_COLWISE
-//   flatten_axis        : axis split for 2D view of input
-//   stochastic_rounding : NVFP4-only; ignored for MXFP8
-//   random_sign_mask_t  : NVFP4-only; ignored for MXFP8
+// V2 grouped quantize: branches on scaling_mode to dispatch MXFP8 (nvte_group_quantize)
+// or NVFP4 (nvte_group_hadamard_transform_*_graph_safe).  Buffers that don't apply to
+// the active mode (e.g. hadamard_matrix for MXFP8) must still be passed but may be
+// empty — see the handler registration below for per-buffer roles.
 Error_Type GroupedQuantizeV2FFI(cudaStream_t stream, Buffer_Type inputs, Buffer_Type scale_unused,
                                 Buffer_Type group_sizes, Buffer_Type sr_rng_state,
                                 Buffer_Type hadamard_matrix, Result_Type rowwise_out,

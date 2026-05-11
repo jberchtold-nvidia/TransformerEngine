@@ -1097,59 +1097,32 @@ class QuantizerFactory:
             A single quantizer or tuple of quantizers
         """
         assert isinstance(scaling_mode, ScalingMode), "Invalid scaling_mode type"
-        if n_groups:
-            if n_quantizers != 1:
-                warnings.warn(
-                    "Using more than one GroupedQuantizer for a grouped input is not recommended"
-                )
-            # GroupedQuantizer wraps a tuple of per-group quantizers but doesn't itself
-            # accept arbitrary per-quantizer kwargs (e.g. use_rht, stochastic_rounding_rng_state).
-            # Pre-create the per-group sub-quantizers with the extra kwargs and pass them
-            # in via the `quantizers` field so __post_init__ doesn't drop them.
-            sub_quantizer_type = QuantizerFactory.quantizer_type_map.get(scaling_mode)
-            if scaling_mode == ScalingMode.NO_SCALING:
-                quantizers = [None] * n_quantizers
-            else:
-                quantizers = []
-                for _ in range(n_quantizers):
-                    sub_quantizers = tuple(
-                        sub_quantizer_type(
-                            q_dtype=q_dtype,
-                            scaling_mode=scaling_mode,
-                            q_layout=q_layout,
-                            checkpoint_name=checkpoint_name,
-                            **kwargs,
-                        )
-                        for _ in range(n_groups)
-                    )
-                    quantizers.append(
-                        GroupedQuantizer(
-                            q_dtype=q_dtype,
-                            scaling_mode=scaling_mode,
-                            q_layout=q_layout,
-                            checkpoint_name=checkpoint_name,
-                            n_groups=n_groups,
-                            quantizers=sub_quantizers,
-                        )
-                    )
-            return quantizers[0] if len(quantizers) == 1 else tuple(quantizers)
+        if n_groups and n_quantizers != 1:
+            warnings.warn(
+                "Using more than one GroupedQuantizer for a grouped input is not recommended"
+            )
 
         quantizer_type = QuantizerFactory.quantizer_type_map.get(scaling_mode)
+        common_kwargs = dict(
+            q_dtype=q_dtype,
+            scaling_mode=scaling_mode,
+            q_layout=q_layout,
+            checkpoint_name=checkpoint_name,
+        )
 
-        if scaling_mode == ScalingMode.NO_SCALING:
-            quantizers = [None] * n_quantizers
-        else:
-            quantizers = []
-            for _ in range(n_quantizers):
-                quantizers.append(
-                    quantizer_type(
-                        q_dtype=q_dtype,
-                        scaling_mode=scaling_mode,
-                        q_layout=q_layout,
-                        checkpoint_name=checkpoint_name,
-                        **kwargs,
-                    )
-                )
+        def _build_one():
+            if scaling_mode == ScalingMode.NO_SCALING:
+                return None
+            if not n_groups:
+                return quantizer_type(**common_kwargs, **kwargs)
+            # GroupedQuantizer.__post_init__ doesn't forward extra kwargs (e.g. use_rht,
+            # stochastic_rounding_rng_state) to its sub-quantizers, so we pre-build them.
+            sub_quantizers = tuple(
+                quantizer_type(**common_kwargs, **kwargs) for _ in range(n_groups)
+            )
+            return GroupedQuantizer(**common_kwargs, n_groups=n_groups, quantizers=sub_quantizers)
+
+        quantizers = [_build_one() for _ in range(n_quantizers)]
         return quantizers[0] if len(quantizers) == 1 else tuple(quantizers)
 
     @staticmethod
