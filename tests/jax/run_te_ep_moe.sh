@@ -70,6 +70,13 @@ for i in $(seq 0 $((NUM_GPUS - 1))); do
         --num-process="$NUM_GPUS"
         --process-id="$i"
     )
+    # Optional pytest -k selector for scoping the run (e.g. to a single
+    # failing test). Example:
+    #   TE_EP_MOE_K="test_backward and sigmoid-bias-strong" \
+    #     bash tests/jax/run_te_ep_moe.sh
+    if [ -n "${TE_EP_MOE_K:-}" ]; then
+        PYTEST_CMD+=( -k "$TE_EP_MOE_K" )
+    fi
     if [ "$i" -eq 0 ]; then
         echo "=== Live output from process 0 ==="
         "${PYTEST_CMD[@]}" 2>&1 | tee "$LOG_FILE" &
