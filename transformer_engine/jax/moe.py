@@ -781,39 +781,6 @@ def _moe_fwd_rule(
     recv_tokens = _inspect(recv_tokens, "fwd/recv_tokens_after_dispatch")
     recv_topk_weights = _inspect(recv_topk_weights, "fwd/recv_topk_weights_after_dispatch")
 
-    # Defensive zero-init of recv_tokens at padded slots. Works around a
-    # narrowly-scoped tex.ep_dispatch_fwd contract gap: the dispatch
-    # kernel zero-initialises the recv buffer correctly for ranks that
-    # receive at least one real token (confirmed via TE_MOE_INSPECT on
-    # softmax / sigmoid / sigmoid-bias-zero configs -- partial-load
-    # ranks see ``sorted_x`` mean approx -0.01 with std approx 0.7,
-    # consistent with mostly-zero padded slots plus a sprinkle of real
-    # N(0,1) tokens), but leaves uninitialised memory in the recv
-    # buffer on ranks that receive ZERO tokens (sigmoid-bias-strong
-    # exposes this: those ranks see ``recv_tokens`` mean approx
-    # -1.2e+29, range approx [-7.8e+33, 3.7]). The uninitialised
-    # garbage overflows the FFN bf16 GEMM into NaN, the saved
-    # ``intermediate`` residual then turns the wo wgrad into NaN
-    # via the IEEE-754 NaN-at-rest rule even though the bwd cotangent
-    # ``d_eo`` is correctly zero on those ranks.
-    #
-    # The fix here mirrors the jnp.where pattern we already apply in
-    # the combine path. recv_topk_weights is the dispatch's own
-    # written-or-not indicator (always 0 at padded slots, non-zero at
-    # real-routed slots), so it gives us the correct mask for free
-    # without needing a separate token_counts gather. This is a no-op
-    # on partially-loaded ranks (padded slots are already 0) and
-    # zeroes the uninitialised garbage on fully-empty ranks.
-    #
-    # TODO: file an upstream bug against tex.ep_dispatch_fwd and
-    # remove this workaround once an upstream fix lands and a TE bump
-    # pulls it in.
-    _dispatch_mask = (recv_topk_weights != 0)[..., None]
-    recv_tokens = jnp.where(
-        _dispatch_mask, recv_tokens, jnp.zeros_like(recv_tokens)
-    )
-    recv_tokens = _inspect(recv_tokens, "fwd/recv_tokens_after_dispatch_sanitize")
-
     # ---------------- FFN (per-shard via shard_map) ----------------
     has_bias = wi_0_bias is not None
     kernel_spec = P(ep_axis, None, None)
@@ -846,6 +813,27 @@ def _moe_fwd_rule(
         else:
             (r_tok, r_w, w0, w1, w_o) = args
             w0b = w1b = wob = None
+        # Per-rank conditional zero-init of r_tok. Works around a
+        # narrowly-scoped tex.ep_dispatch_fwd contract gap: the dispatch
+        # kernel zero-initialises the recv buffer correctly on ranks
+        # that receive at least one token, but leaves uninitialised
+        # memory on fully-empty-receiver ranks. ``r_w`` (the dispatch's
+        # own written-or-not indicator: 0 at padded slots, non-zero at
+        # real-routed slots) gives us a per-shard predicate for free.
+        # ``jax.lax.cond`` only executes the selected branch, so loaded
+        # ranks pay nothing at runtime; only empty ranks do the
+        # zero-fill. See INTEGRATION_DESIGN.md "FOLLOW-UP" for the bug
+        # surface details. TODO: remove once tex.ep_dispatch_fwd is
+        # fixed upstream (or once we adopt tex.tokens_per_expert as
+        # local_group_sizes to bypass padded slots entirely).
+        rank_has_tokens = jnp.any(r_w != 0)
+        r_tok = jax.lax.cond(
+            rank_has_tokens,
+            lambda x: x,
+            lambda x: jnp.zeros_like(x),
+            r_tok,
+        )
+        r_tok = _inspect(r_tok, "fwd/recv_tokens_after_dispatch_sanitize")
         return _ffn_fwd_per_shard(
             r_tok,
             r_w,
