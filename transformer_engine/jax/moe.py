@@ -441,18 +441,31 @@ def _ffn_bwd_per_shard(
     recv_w_flat = recv_topk_weights_local.reshape(-1)
     q_set = noop_quantizer_set
 
+    # FFN bwd sub-step probes (TE_MOE_INSPECT=1 only). Pin down which
+    # bwd sub-step introduces NaN/Inf for the sigmoid-bias-strong
+    # config where some EP ranks have ZERO tokens routed to every
+    # local expert (empty-rank case). For those ranks d_eo_2d should
+    # be entirely zero; if any downstream tensor is non-finite the
+    # offending sub-step is the one that turned a clean zero input
+    # into NaN/Inf.
+    d_eo_2d = _inspect(d_eo_2d, "ffn_bwd/d_eo_2d_in")
+
     # wo bwd
     casted_d_eo = tex.grouped_quantize(d_eo_2d, q_set.dgrad, local_group_sizes, flatten_axis=-1)
+    _casted_d_eo_lhs = casted_d_eo.get_tensor(usage=TensorUsage.LHS)
+    _casted_d_eo_rhs = casted_d_eo.get_tensor(usage=TensorUsage.RHS)
     d_intermediate = tex.grouped_gemm(
-        casted_d_eo.get_tensor(usage=TensorUsage.LHS),
+        _casted_d_eo_lhs,
         casted_wo_rhs_trans,
         contracting_dims=((1,), (2,)),
     )
+    d_intermediate = _inspect(d_intermediate, "ffn_bwd/d_intermediate_after_wo_dgrad")
     d_wo = tex.grouped_gemm(
         casted_intermediate_lhs_trans,
-        casted_d_eo.get_tensor(usage=TensorUsage.RHS),
+        _casted_d_eo_rhs,
         contracting_dims=((0,), (0,)),
     )
+    d_wo = _inspect(d_wo, "ffn_bwd/d_wo_after_wgrad_pre_psum")
     d_wo_bias = tex.grouped_dbias(d_eo_2d, local_group_sizes) if has_bias else None
 
     act_fn = _convert_to_activation_function(activation_type)
@@ -481,6 +494,8 @@ def _ffn_bwd_per_shard(
     d_up_proj_out = (d_int_fp32 * act_gp_fp32).astype(up_proj_out.dtype)
     (d_gate_proj_fp32,) = dact_pullback_fp32(d_int_fp32 * up_fp32)
     d_gate_proj_out = d_gate_proj_fp32.astype(gate_proj_out.dtype)
+    d_up_proj_out = _inspect(d_up_proj_out, "ffn_bwd/d_up_proj_out_after_act_bwd")
+    d_gate_proj_out = _inspect(d_gate_proj_out, "ffn_bwd/d_gate_proj_out_after_act_bwd")
 
     # wi bwd (split gate/up). Two separate 3D grouped_gemm calls each
     # for d_sorted_x and d_w_i, mirroring the un-fused fwd. The fused
@@ -506,6 +521,7 @@ def _ffn_bwd_per_shard(
         contracting_dims=((1,), (2,)),
     )
     d_sorted_x = d_sorted_x_from_gate + d_sorted_x_from_up
+    d_sorted_x = _inspect(d_sorted_x, "ffn_bwd/d_sorted_x_after_wi_dgrad_sum")
     d_wi_0 = tex.grouped_gemm(
         casted_sorted_x_lhs_trans,
         casted_d_gate.get_tensor(usage=TensorUsage.RHS),
@@ -516,6 +532,8 @@ def _ffn_bwd_per_shard(
         casted_d_up.get_tensor(usage=TensorUsage.RHS),
         contracting_dims=((0,), (0,)),
     )
+    d_wi_0 = _inspect(d_wi_0, "ffn_bwd/d_wi_0_after_wgrad_pre_psum")
+    d_wi_1 = _inspect(d_wi_1, "ffn_bwd/d_wi_1_after_wgrad_pre_psum")
     if has_bias:
         d_wi_0_bias = tex.grouped_dbias(d_gate_proj_out_b, local_group_sizes)
         d_wi_1_bias = tex.grouped_dbias(d_up_proj_out_b, local_group_sizes)
@@ -1070,6 +1088,14 @@ def _moe_bwd_rule(
                 d_wi_0_bias = jax.lax.psum(d_wi_0_bias, axis_name=dp)
                 d_wi_1_bias = jax.lax.psum(d_wi_1_bias, axis_name=dp)
                 d_wo_bias = jax.lax.psum(d_wo_bias, axis_name=dp)
+        # Post-psum probes (TE_MOE_INSPECT=1 only). The
+        # sigmoid-bias-strong test asserts on the final d_wo / d_wi_*
+        # after the DP psum. If pre-psum probes (above, in
+        # _ffn_bwd_per_shard) are clean but post-psum is NaN, the DP
+        # psum across an empty-rank shard is the offender.
+        d_wo = _inspect(d_wo, "ffn_bwd/d_wo_post_psum")
+        d_wi_0 = _inspect(d_wi_0, "ffn_bwd/d_wi_0_post_psum")
+        d_wi_1 = _inspect(d_wi_1, "ffn_bwd/d_wi_1_post_psum")
         return (
             d_sorted_x_3d,
             d_recv_w_3d,
