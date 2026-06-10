@@ -83,6 +83,31 @@ from .sharding import _get_mesh
 __all__ = ["moe"]
 
 
+def _with_sharding_constraint_cast_bwd(x: jnp.ndarray, sharding) -> jnp.ndarray:
+    """Apply a sharding constraint while keeping bwd cotangents in the primal dtype.
+
+    Plain ``jax.lax.with_sharding_constraint`` propagates cotangents in
+    whatever dtype the upstream gradient lands in; under mixed precision
+    that can be wider than the primal, blowing up bandwidth and (for
+    bf16 primals) breaking downstream kernels that pin a bf16 input
+    layout. This wrapper re-casts the cotangent back to the primal
+    dtype and re-asserts the same sharding on the bwd path.
+    """
+
+    @jax.custom_vjp
+    def _constraint(y):
+        return jax.lax.with_sharding_constraint(y, sharding)
+
+    def _constraint_fwd(y):
+        return jax.lax.with_sharding_constraint(y, sharding), jnp.zeros((), dtype=y.dtype)
+
+    def _constraint_bwd(dtype_ref, grad):
+        return (jax.lax.with_sharding_constraint(grad.astype(dtype_ref.dtype), sharding),)
+
+    _constraint.defvjp(_constraint_fwd, _constraint_bwd)
+    return _constraint(x)
+
+
 # =============================================================================
 # Process-level NCCL EP bootstrap (must run eagerly, outside jax.jit)
 # =============================================================================
@@ -631,10 +656,11 @@ def _moe_fwd_rule(
     # local expert. We must size to that worst case or NCCL EP's HT kernel
     # rejects the dispatch buffer with ``invalid argument``.
     natural_spe = num_ep * max_tokens_per_rank  # = (B // dp_size) * S
-    if align_size > 0:
-        slots_per_expert = ((natural_spe + align_size - 1) // align_size) * align_size
-    else:
-        slots_per_expert = natural_spe
+    # NCCL EP requires each expert-major output block to be at least
+    # 128-token aligned. Keep larger caller-requested alignments, but
+    # do not emit a smaller natural block size for tiny tests.
+    effective_align = max(int(align_size), 128)
+    slots_per_expert = ((natural_spe + effective_align - 1) // effective_align) * effective_align
     recv_pr = num_local_experts * slots_per_expert
 
     _te_ep_assert_compatible_bootstrap(
@@ -1406,7 +1432,7 @@ def moe(
             UserWarning,
             stacklevel=2,
         )
-    x = jax.lax.with_sharding_constraint(x, NamedSharding(mesh, expected_spec))
+    x = _with_sharding_constraint_cast_bwd(x, NamedSharding(mesh, expected_spec))
 
     # custom_vjp can't trace through None args; lower expert_bias to an
     # empty shape-(0,) tensor that fused_topk_with_score_function treats
