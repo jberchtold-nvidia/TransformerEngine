@@ -37,7 +37,6 @@ path and overlaps with the dispatch collective).
 
 from dataclasses import dataclass
 from functools import partial
-import os
 from typing import Any, Dict, Optional, Tuple, Union
 import warnings
 
@@ -47,30 +46,6 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from . import cpp_extensions as tex
-
-
-# Lazy / opt-in: setting TE_MOE_INSPECT=1 in the env wires TE's
-# inspect_array FFI through the fwd and bwd. When unset (default),
-# _inspect is the identity, so this has zero runtime cost in normal use.
-# Dumps land in the process CWD as
-# my_tensor_gpu{N}_{sanitized_name}.bin + ..._meta.json (one per probe
-# per rank, since 9cb4cfca threaded `name` through the FFI). Each call
-# also prints a labelled line ``[gpuN <name>]: ...`` to stdout. We use
-# the FFI rather than jax.debug.print because jax.debug.print can
-# deadlock under multi-process (callback ordering across processes is
-# not synchronised).
-_INSPECT_ENABLED = os.environ.get("TE_MOE_INSPECT", "0") == "1"
-if _INSPECT_ENABLED:
-    from .debug.experimental import inspect_array as _te_inspect_array
-
-    def _inspect(x: jnp.ndarray, name: str) -> jnp.ndarray:
-        return _te_inspect_array(x, name)
-
-else:
-
-    def _inspect(x: jnp.ndarray, name: str) -> jnp.ndarray:
-        del name
-        return x
 from .quantize import (
     TensorUsage,
     noop_quantizer_set,
@@ -362,16 +337,15 @@ def _ffn_fwd_per_shard(
     # An older fused 4D variant built via jnp.stack([wi_0, wi_1], axis=-2)
     # put a non-contracting axis in the middle of the RHS, which the
     # kernel walked as if it were 3D and read off the end -> NaN.
-    # Confirmed via TE_MOE_INSPECT bisect: the stack-axis variant
+    # Bisected against a jnp.einsum reference: the stack-axis variant
     # produced all-NaN output, while the concat-axis variant (this
-    # path) produces finite outputs matching the jnp.einsum reference.
+    # path) produces finite outputs matching the reference.
     wi_combined = jnp.concatenate([wi_0, wi_1], axis=-1)
     wi_combined_bias = (
         jnp.concatenate([wi_0_bias, wi_1_bias], axis=-1) if wi_0_bias is not None else None
     )
 
     q_set = noop_quantizer_set
-    sorted_x = _inspect(sorted_x, "ffn_fwd/sorted_x_in")
     casted_sorted_x = tex.grouped_quantize(sorted_x, q_set.x, local_group_sizes, flatten_axis=-1)
     casted_wi = tex.grouped_quantize(wi_combined, q_set.kernel, flatten_axis=-1)
     combined_out = tex.grouped_gemm(
@@ -381,8 +355,6 @@ def _ffn_fwd_per_shard(
         bias=wi_combined_bias,
     )
     gate_proj_out, up_proj_out = jnp.split(combined_out, 2, axis=-1)
-    gate_proj_out = _inspect(gate_proj_out, "ffn_fwd/gate_proj_out")
-    up_proj_out = _inspect(up_proj_out, "ffn_fwd/up_proj_out")
     casted_sorted_x_lhs_trans = casted_sorted_x.get_tensor(usage=TensorUsage.LHS_TRANS)
     casted_wi_rhs_trans = casted_wi.get_tensor(usage=TensorUsage.RHS_TRANS)
 
@@ -397,7 +369,6 @@ def _ffn_fwd_per_shard(
         act_fn(gate_proj_out.astype(jnp.float32))
         * up_proj_out.astype(jnp.float32)
     ).astype(sorted_x.dtype)
-    intermediate = _inspect(intermediate, "ffn_fwd/intermediate_after_silu_mul")
 
     if apply_topk_weights_early:
         # Fold the per-token combine weights into the FFN intermediate;
@@ -419,7 +390,6 @@ def _ffn_fwd_per_shard(
         contracting_dims=((1,), (1,)),
         bias=wo_bias,
     )
-    expert_outputs = _inspect(expert_outputs, "ffn_fwd/expert_outputs_after_wo_gemm")
     casted_intermediate_lhs_trans = casted_intermediate.get_tensor(usage=TensorUsage.LHS_TRANS)
     casted_wo_rhs_trans = casted_wo.get_tensor(usage=TensorUsage.RHS_TRANS)
 
@@ -461,15 +431,6 @@ def _ffn_bwd_per_shard(
     recv_w_flat = recv_topk_weights_local.reshape(-1)
     q_set = noop_quantizer_set
 
-    # FFN bwd sub-step probes (TE_MOE_INSPECT=1 only). Pin down which
-    # bwd sub-step introduces NaN/Inf for the sigmoid-bias-strong
-    # config where some EP ranks have ZERO tokens routed to every
-    # local expert (empty-rank case). For those ranks d_eo_2d should
-    # be entirely zero; if any downstream tensor is non-finite the
-    # offending sub-step is the one that turned a clean zero input
-    # into NaN/Inf.
-    d_eo_2d = _inspect(d_eo_2d, "ffn_bwd/d_eo_2d_in")
-
     # wo bwd
     casted_d_eo = tex.grouped_quantize(d_eo_2d, q_set.dgrad, local_group_sizes, flatten_axis=-1)
     _casted_d_eo_lhs = casted_d_eo.get_tensor(usage=TensorUsage.LHS)
@@ -479,13 +440,11 @@ def _ffn_bwd_per_shard(
         casted_wo_rhs_trans,
         contracting_dims=((1,), (2,)),
     )
-    d_intermediate = _inspect(d_intermediate, "ffn_bwd/d_intermediate_after_wo_dgrad")
     d_wo = tex.grouped_gemm(
         casted_intermediate_lhs_trans,
         _casted_d_eo_rhs,
         contracting_dims=((0,), (0,)),
     )
-    d_wo = _inspect(d_wo, "ffn_bwd/d_wo_after_wgrad_pre_psum")
     d_wo_bias = tex.grouped_dbias(d_eo_2d, local_group_sizes) if has_bias else None
 
     act_fn = _convert_to_activation_function(activation_type)
@@ -514,8 +473,6 @@ def _ffn_bwd_per_shard(
     d_up_proj_out = (d_int_fp32 * act_gp_fp32).astype(up_proj_out.dtype)
     (d_gate_proj_fp32,) = dact_pullback_fp32(d_int_fp32 * up_fp32)
     d_gate_proj_out = d_gate_proj_fp32.astype(gate_proj_out.dtype)
-    d_up_proj_out = _inspect(d_up_proj_out, "ffn_bwd/d_up_proj_out_after_act_bwd")
-    d_gate_proj_out = _inspect(d_gate_proj_out, "ffn_bwd/d_gate_proj_out_after_act_bwd")
 
     # wi bwd (fused gate/up via concat). Mirror the fused fwd: pack the
     # gate/up cotangents along the trailing axis, run a single
@@ -531,15 +488,12 @@ def _ffn_bwd_per_shard(
         casted_wi_rhs_trans,
         contracting_dims=((1,), (2,)),
     )
-    d_sorted_x = _inspect(d_sorted_x, "ffn_bwd/d_sorted_x_after_wi_dgrad_sum")
     d_wi_combined = tex.grouped_gemm(
         casted_sorted_x_lhs_trans,
         casted_d_combined.get_tensor(usage=TensorUsage.RHS),
         contracting_dims=((0,), (0,)),
     )
     d_wi_0, d_wi_1 = jnp.split(d_wi_combined, 2, axis=-1)
-    d_wi_0 = _inspect(d_wi_0, "ffn_bwd/d_wi_0_after_wgrad_pre_psum")
-    d_wi_1 = _inspect(d_wi_1, "ffn_bwd/d_wi_1_after_wgrad_pre_psum")
     if has_bias:
         d_wi_combined_bias = tex.grouped_dbias(d_combined, local_group_sizes)
         d_wi_0_bias, d_wi_1_bias = jnp.split(d_wi_combined_bias, 2, axis=-1)
@@ -691,7 +645,6 @@ def _moe_fwd_rule(
         expert_bias=eb_arg,
         compute_aux_scores=False,
     )
-    sparse_probs = _inspect(sparse_probs, "fwd/sparse_probs_after_fused_topk")
     # Sigmoid + K>1 normalises as `weights / (weights.sum + 1e-20)`; for
     # tokens whose top-K sigmoid scores all underflow at bf16/fp32 the
     # output is NaN at the selected positions. Those NaNs ride
@@ -702,7 +655,6 @@ def _moe_fwd_rule(
     # are already zero (routing_map is False there); only the rare
     # underflow path emits NaN.
     sparse_probs = jnp.where(jnp.isnan(sparse_probs), 0, sparse_probs).astype(dtype)
-    sparse_probs = _inspect(sparse_probs, "fwd/sparse_probs_after_sanitize")
 
     # ---------------- Aux loss (global view, replicated) ----------------
     # ``fused_moe_aux_loss_fwd`` sums probs and tokens_per_expert across
@@ -771,7 +723,6 @@ def _moe_fwd_rule(
     topk_w_3d = jax.lax.with_sharding_constraint(
         topk_w_3d, NamedSharding(mesh, ep3_spec)
     )
-    topk_w_3d = _inspect(topk_w_3d, "fwd/topk_w_3d_before_dispatch")
 
     # ---------------- TE EP dispatch (global view) ----------------
     handle = _get_or_make_ep_handle(
@@ -785,8 +736,6 @@ def _moe_fwd_rule(
     recv_topk_weights = jax.lax.with_sharding_constraint(
         recv_topk_weights, NamedSharding(mesh, ep2_spec)
     )
-    recv_tokens = _inspect(recv_tokens, "fwd/recv_tokens_after_dispatch")
-    recv_topk_weights = _inspect(recv_topk_weights, "fwd/recv_topk_weights_after_dispatch")
 
     # ---------------- FFN (per-shard via shard_map) ----------------
     has_bias = wi_0_bias is not None
@@ -822,18 +771,17 @@ def _moe_fwd_rule(
             (r_tok, r_w, w0, w1, w_o) = args
             w0b = w1b = wob = None
         # Per-rank conditional zero-init of r_tok. Works around a
-        # narrowly-scoped tex.ep_dispatch_fwd contract gap: the dispatch
-        # kernel zero-initialises the recv buffer correctly on ranks
-        # that receive at least one token, but leaves uninitialised
-        # memory on fully-empty-receiver ranks. ``r_w`` (the dispatch's
-        # own written-or-not indicator: 0 at padded slots, non-zero at
-        # real-routed slots) gives us a per-shard predicate for free.
-        # ``jax.lax.cond`` only executes the selected branch, so loaded
-        # ranks pay nothing at runtime; only empty ranks do the
-        # zero-fill. See INTEGRATION_DESIGN.md "FOLLOW-UP" for the bug
-        # surface details. TODO: remove once tex.ep_dispatch_fwd is
-        # fixed upstream (or once we adopt tex.tokens_per_expert as
-        # local_group_sizes to bypass padded slots entirely).
+        # narrowly-scoped tex.ep_dispatch_fwd contract gap: the NCCL EP
+        # HT dispatch kernel zero-initialises the recv buffer correctly
+        # on ranks that receive at least one token, but leaves
+        # uninitialised memory on fully-empty-receiver ranks. ``r_w``
+        # (the dispatch's own written-or-not indicator: 0 at padded
+        # slots, non-zero at real-routed slots) gives us a per-shard
+        # predicate for free. ``jax.lax.cond`` only executes the
+        # selected branch, so loaded ranks pay nothing at runtime;
+        # only empty ranks do the zero-fill.
+        # TODO: remove once tex.ep_dispatch_fwd zero-inits empty-rank
+        # recv buffers upstream.
         rank_has_tokens = jnp.any(r_w != 0)
         r_tok = jax.lax.cond(
             rank_has_tokens,
@@ -841,7 +789,6 @@ def _moe_fwd_rule(
             lambda x: jnp.zeros_like(x),
             r_tok,
         )
-        r_tok = _inspect(r_tok, "fwd/recv_tokens_after_dispatch_sanitize")
         return _ffn_fwd_per_shard(
             r_tok,
             r_w,
@@ -867,7 +814,6 @@ def _moe_fwd_rule(
     expert_outputs = jax.lax.with_sharding_constraint(
         expert_outputs, NamedSharding(mesh, ep3_spec)
     )
-    expert_outputs = _inspect(expert_outputs, "fwd/expert_outputs_before_combine")
 
     # ---------------- TE EP combine (global view) ----------------
     out_partition_spec = (batch_pspec_axis, None, None)
@@ -884,11 +830,10 @@ def _moe_fwd_rule(
         # IEEE 754: NaN * 0 = NaN, so a multiplicative mask cannot kill
         # the NaNs ep_dispatch_fwd leaves at padded slots of recv_tokens
         # (they ride through the FFN into expert_outputs at the same
-        # padded positions). Use jnp.where to overwrite padded positions
-        # with a literal 0 before combine — confirmed via TE_MOE_INSPECT
-        # that mean=NaN on expert_outputs[padded] can propagate into the
-        # combine output when the kernel's read pattern overlaps the
-        # padded region.
+        # padded positions): mean=NaN on expert_outputs[padded] then
+        # propagates into the combine output when the kernel's read
+        # pattern overlaps the padded region. Use jnp.where to overwrite
+        # padded positions with a literal 0 before combine.
         w = recv_topk_weights[..., None].astype(expert_outputs.dtype)
         mask_bool = (recv_topk_weights != 0)[..., None]
         weighted = jnp.where(mask_bool, expert_outputs * w, jnp.zeros_like(expert_outputs))
@@ -899,7 +844,6 @@ def _moe_fwd_rule(
             num_local_tokens=(B, S),
             out_partition_spec=out_partition_spec,
         )
-    output = _inspect(output, "fwd/output_after_combine")
 
     (
         casted_sorted_x_lhs_trans,
@@ -995,12 +939,10 @@ def _moe_bwd_rule(
 
     # ---------------- Combine bwd (global view) ----------------
     d_output = jax.lax.with_sharding_constraint(d_output, NamedSharding(mesh, ep3_spec))
-    d_output = _inspect(d_output, "bwd/d_output_into_combine_bwd")
     grad_pre_combine = tex.ep_combine_bwd(ctx.handle, ctx.handle_mem, d_output, recv_pr)
     grad_pre_combine = jax.lax.with_sharding_constraint(
         grad_pre_combine, NamedSharding(mesh, ep3_spec)
     )
-    grad_pre_combine = _inspect(grad_pre_combine, "bwd/grad_pre_combine_after_combine_bwd")
 
     if apply_topk_weights_early:
         # combine_fwd consumed already-weighted expert_outputs; the recv_w
@@ -1020,23 +962,19 @@ def _moe_bwd_rule(
         # propagates through grad_pre_combine * w * mask into d_expert_outputs
         # and then into every downstream gradient (gate_kernel ends up
         # all-NaN). Sanitize once here.
-        recv_w_raw = _inspect(
-            ctx.recv_topk_weights, "bwd/ctx.recv_topk_weights_before_sanitize"
-        )
-        recv_w_clean = jnp.where(jnp.isnan(recv_w_raw), 0, recv_w_raw)
+        recv_w_clean = jnp.where(jnp.isnan(ctx.recv_topk_weights), 0, ctx.recv_topk_weights)
         # IEEE 754: NaN * 0 = NaN, so multiplying grad_pre_combine by a
         # 0/1 mask cannot kill the NaNs tex.ep_combine_bwd leaves at
-        # padded slots of grad_pre_combine. Confirmed via TE_MOE_INSPECT:
-        # ctx.recv_topk_weights is clean (after the recv_w_clean
-        # sanitize above), but grad_pre_combine[padded] is NaN, so
-        # grad_pre_combine * w * mask = NaN. Use jnp.where to overwrite
-        # padded positions with literal 0 instead.
+        # padded slots of grad_pre_combine: ctx.recv_topk_weights is
+        # clean after the sanitize above, but grad_pre_combine[padded]
+        # is still NaN, so grad_pre_combine * w * mask = NaN. Use
+        # jnp.where to overwrite padded positions with literal 0
+        # instead.
         w = recv_w_clean[..., None].astype(grad_pre_combine.dtype)
         mask_bool = (recv_w_clean != 0)[..., None]
         d_expert_outputs = jnp.where(
             mask_bool, grad_pre_combine * w, jnp.zeros_like(grad_pre_combine)
         )
-        d_expert_outputs = _inspect(d_expert_outputs, "bwd/d_expert_outputs_after_w_mask_split")
         # Same masking strategy for the cotangent on recv_topk_weights:
         # grad_pre_combine has NaN at padded slots and ctx.expert_outputs
         # may too, so the per-element product must be jnp.where'd before
@@ -1113,14 +1051,6 @@ def _moe_bwd_rule(
                 d_wi_0_bias = jax.lax.psum(d_wi_0_bias, axis_name=dp)
                 d_wi_1_bias = jax.lax.psum(d_wi_1_bias, axis_name=dp)
                 d_wo_bias = jax.lax.psum(d_wo_bias, axis_name=dp)
-        # Post-psum probes (TE_MOE_INSPECT=1 only). The
-        # sigmoid-bias-strong test asserts on the final d_wo / d_wi_*
-        # after the DP psum. If pre-psum probes (above, in
-        # _ffn_bwd_per_shard) are clean but post-psum is NaN, the DP
-        # psum across an empty-rank shard is the offender.
-        d_wo = _inspect(d_wo, "ffn_bwd/d_wo_post_psum")
-        d_wi_0 = _inspect(d_wi_0, "ffn_bwd/d_wi_0_post_psum")
-        d_wi_1 = _inspect(d_wi_1, "ffn_bwd/d_wi_1_post_psum")
         return (
             d_sorted_x_3d,
             d_recv_w_3d,
@@ -1176,7 +1106,6 @@ def _moe_bwd_rule(
         jnp.arange(ctx.routing_map.shape[0])[:, None], selected_experts
     ].set(d_topk_w_flat)
 
-    d_sparse_probs = _inspect(d_sparse_probs, "bwd/d_sparse_probs_before_topk_bwd")
     d_logits_2d = tex.fused_topk_with_score_function_bwd(
         ctx.routing_map,
         ctx.saved_scores,
@@ -1187,7 +1116,6 @@ def _moe_bwd_rule(
         score_function=score_function,
         compute_aux_scores=False,
     )
-    d_logits_2d = _inspect(d_logits_2d, "bwd/d_logits_2d_after_topk_bwd")
 
     # ---------------- Aux loss bwd (global view, replicated) ----------------
     # Reverse the fwd's all-gather/aux pipeline: aux_loss_bwd produces
@@ -1225,7 +1153,6 @@ def _moe_bwd_rule(
     gate_kernel_cast = ctx.gate_kernel.astype(ctx.x.dtype)
     d_x_from_gate = jnp.einsum("bse,he->bsh", d_gate_logits, gate_kernel_cast)
     d_gate_kernel = jnp.einsum("bsh,bse->he", ctx.x, d_gate_logits).astype(ctx.gate_kernel.dtype)
-    d_gate_kernel = _inspect(d_gate_kernel, "bwd/d_gate_kernel_final")
     d_x = d_x_from_gate + d_x_from_dispatch
 
     # Pin output grads to the declared logical axes so downstream
