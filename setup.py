@@ -83,31 +83,21 @@ def setup_common_extension() -> CMakeExtension:
         cusolvermp_dir = os.getenv("CUSOLVERMP_HOME", "/usr")
         cmake_flags.append(f"-DCUSOLVERMP_DIR={cusolvermp_dir}")
 
-    # NCCL EP: on by default; auto-disabled if no arch >= 90.
-    # Set NVTE_BUILD_WITH_NCCL_EP=0/1 to force off/on.
-    nccl_ep_env = os.getenv("NVTE_BUILD_WITH_NCCL_EP")
-    explicit_nccl_ep = nccl_ep_env is not None
-    build_with_nccl_ep = bool(int(nccl_ep_env)) if explicit_nccl_ep else True
-
+    # NCCL EP (Hopper+): on by default; auto-skipped when no arch >= 90 is
+    # targeted. Set NVTE_BUILD_WITH_NCCL_EP=0 to force off.
+    build_with_nccl_ep = bool(int(os.getenv("NVTE_BUILD_WITH_NCCL_EP", "1")))
     if build_with_nccl_ep:
         arch_tokens = [a.strip() for a in str(archs or "").split(";") if a.strip()]
-        has_hopper_or_newer = any(t.lower() == "native" for t in arch_tokens) or any(
-            int(t.rstrip("af")) >= 90 for t in arch_tokens if t.rstrip("af").isdigit()
+        has_hopper_or_newer = any(
+            t.lower() == "native" or (t.rstrip("af").isdigit() and int(t.rstrip("af")) >= 90)
+            for t in arch_tokens
         )
         if not has_hopper_or_newer:
-            if explicit_nccl_ep:
-                raise RuntimeError(
-                    "NVTE_BUILD_WITH_NCCL_EP=1 requires at least one CUDA arch >= 90 in "
-                    f"NVTE_CUDA_ARCHS (got '{archs}'). Add '90' or unset NVTE_BUILD_WITH_NCCL_EP."
-                )
-            print(
-                "[NCCL EP] No CUDA arch >= 90 in NVTE_CUDA_ARCHS"
-                f" ('{archs}'); auto-disabling NCCL EP (nvte_ep_* will throw at runtime)."
-            )
+            print(f"[NCCL EP] No arch >= 90 in NVTE_CUDA_ARCHS ('{archs}'); skipping build.")
             build_with_nccl_ep = False
-
     if build_with_nccl_ep:
-        build_nccl_ep_submodule()
+        nccl_home = build_nccl_ep_submodule()
+        cmake_flags.append(f"-DNCCL_INCLUDE_DIR={nccl_home}/include")
     else:
         cmake_flags.append("-DNVTE_WITH_NCCL_EP=OFF")
 
@@ -198,8 +188,9 @@ def _discover_nccl_home() -> str:
 def build_nccl_ep_submodule() -> str:
     """Build libnccl_ep.so from the 3rdparty/nccl submodule.
 
-    NCCL EP is on by default; the system NCCL core (libnccl.so) supplies the
-    headers and runtime symbols. Returns the submodule build directory.
+    Returns the discovered NCCL core install prefix (the path that contains
+    include/nccl.h and lib/libnccl.so), which the caller passes to CMake as
+    NCCL_INCLUDE_DIR for TE's own NCCL link.
     """
     nccl_root = current_file_path / "3rdparty" / "nccl"
     if not (nccl_root / "Makefile").exists():
@@ -211,15 +202,17 @@ def build_nccl_ep_submodule() -> str:
     build_dir = nccl_root / "build"
     nccl_ep_lib = build_dir / "lib" / "libnccl_ep.so"
 
-    archs = cuda_archs() or "90"
-    arch_list = []
-    for a in str(archs).split(";"):
-        a = a.strip().rstrip("af")
-        if a and a.isdigit() and int(a) >= 90:
-            arch_list.append(a)
-    if not arch_list:
-        arch_list = ["90"]
-    gencode = " ".join(f"-gencode=arch=compute_{a},code=sm_{a}" for a in arch_list)
+    # Caller gates on arch >= 90 or "native"; let nvcc resolve "native".
+    arch_tokens = [a.strip() for a in str(cuda_archs() or "").split(";") if a.strip()]
+    if any(t.lower() == "native" for t in arch_tokens):
+        gencode = "-arch=native"
+    else:
+        arch_list = [
+            t.rstrip("af")
+            for t in arch_tokens
+            if t.rstrip("af").isdigit() and int(t.rstrip("af")) >= 90
+        ]
+        gencode = " ".join(f"-gencode=arch=compute_{a},code=sm_{a}" for a in arch_list)
 
     nproc = os.cpu_count() or 8
     env = os.environ.copy()
@@ -238,25 +231,17 @@ def build_nccl_ep_submodule() -> str:
             env=env,
         )
 
-    # TE's CMake expects nccl.h under 3rdparty/nccl/build/include/ for its
-    # version check. Mirror the top-level host headers from the system NCCL
-    # install — DON'T mirror nccl_device/ because the submodule ships its own
-    # newer copy at src/include/nccl_device/ with device-side templates that
-    # conflict with older system versions, and the JIT include path picks the
-    # submodule's.
-    nccl_include = build_dir / "include"
-    nccl_include.mkdir(parents=True, exist_ok=True)
-    for cand in (Path(nccl_home) / "include", Path("/usr/include")):
-        p = Path(cand)
-        if (p / "nccl.h").exists():
-            for name in ("nccl.h", "nccl_net.h", "nccl_tuner.h"):
-                src = p / name
-                dst = nccl_include / name
-                if src.exists() and not dst.exists():
-                    dst.symlink_to(src)
-            break
+    # Stage libnccl_ep.so.0 alongside libtransformer_engine.so so $ORIGIN-rpath
+    # finds it in the installed wheel.
+    soname = "libnccl_ep.so.0"
+    src = (build_dir / "lib" / soname).resolve()
+    dst = current_file_path / "transformer_engine" / soname
+    if dst.is_symlink() or dst.exists():
+        dst.unlink()
+    shutil.copy2(src, dst)
+    print(f"[NCCL EP] Bundled {dst} ({src.stat().st_size // (1 << 20)} MB)")
 
-    return str(build_dir)
+    return nccl_home
 
 
 def git_check_submodules() -> None:
@@ -339,7 +324,8 @@ if __name__ == "__main__":
     else:
         install_requires, test_requires = setup_requirements()
         ext_modules = [setup_common_extension()]
-        package_data = {"": ["VERSION.txt"]}
+        # libnccl_ep.so.0 is staged by build_nccl_ep_submodule(); ship it.
+        package_data = {"": ["VERSION.txt"], "transformer_engine": ["libnccl_ep.so*"]}
         include_package_data = True
         extras_require = {"test": test_requires}
 

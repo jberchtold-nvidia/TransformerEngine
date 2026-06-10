@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from transformer_engine.jax.ep import ep_bootstrap, ep_make_handle, ep_dispatch, ep_combine
+from transformer_engine.jax.ep import EpLayerConfig, ep_bootstrap, ep_dispatch, ep_combine
 from transformer_engine.jax.sharding import MeshResource, global_shard_guard
 
 
@@ -42,6 +42,12 @@ def _parse_args():
         action="store_true",
         default=True,
         help="Verify fwd+bwd against a single-rank numpy reference.",
+    )
+    p.add_argument(
+        "--iters",
+        type=int,
+        default=3,
+        help="Number of fwd+bwd iterations to run (same compiled jit, same handle_mem).",
     )
     return p.parse_args()
 
@@ -199,7 +205,7 @@ def _moe_step(args, topk_idx, tokens, topk_w, kernels):
     kernel_spec = PartitionSpec("ep", None, None, None)
 
     kernels = kernels.reshape(ep_size, NLE, *kernels.shape[1:])
-    ep_handle = ep_make_handle(args.top_k, dispatch_output_per_expert_alignment=16)
+    layer_cfg = EpLayerConfig(top_k=args.top_k, dispatch_output_per_expert_alignment=16)
 
     @jax.jit
     def step(topk_idx, tokens, topk_w, local_kernels):
@@ -210,18 +216,24 @@ def _moe_step(args, topk_idx, tokens, topk_w, kernels):
             local_kernels, NamedSharding(mesh, kernel_spec)
         )
         recv_tokens, recv_topk_w, handle_mem, _tc = ep_dispatch(
-            ep_handle, topk_idx, tokens, topk_w, args.recv_capacity_per_rank
+            layer_cfg, topk_idx, tokens, topk_w, args.recv_capacity_per_rank
         )
         recv_tokens = jax.lax.with_sharding_constraint(recv_tokens, NamedSharding(mesh, ep3))
         recv_topk_w = jax.lax.with_sharding_constraint(recv_topk_w, NamedSharding(mesh, ep2))
         expert_out = _batched_expert_linear(recv_tokens, local_kernels, NLE, dp_size, ep_size)
         expert_out = jax.lax.with_sharding_constraint(expert_out, NamedSharding(mesh, ep3))
+        # ep_combine is unweighted: pre-multiply by recv_topk_w and zero
+        # padded slots (recv_topk_w == 0) before the scatter-sum.
+        mask = (recv_topk_w != 0).astype(jnp.float32)[..., None]
+        weighted = (expert_out.astype(jnp.float32) * recv_topk_w[..., None] * mask).astype(
+            expert_out.dtype
+        )
+        weighted = jax.lax.with_sharding_constraint(weighted, NamedSharding(mesh, ep3))
         return ep_combine(
-            ep_handle,
+            layer_cfg,
             handle_mem,
             _tc,
-            expert_out,
-            recv_topk_w,
+            weighted,
             num_local_tokens=(B, S),
             out_sharding=(("dp", "ep"), None, None),
         )
@@ -280,13 +292,10 @@ def main():
         ep_bootstrap(
             world_size=args.num_processes,
             rank=args.process_id,
-            ep_size=args.ep_size,
             num_experts=args.num_experts,
             max_tokens_per_rank=args.num_tokens,
             recv_capacity_per_rank=args.recv_capacity_per_rank,
             hidden_dim=args.hidden,
-            # XLA reallocates handle_mem between JIT executables.
-            allow_handle_mem_reloc=True,
         )
 
         (
@@ -304,18 +313,20 @@ def main():
             out = _moe_step(args, idx, toks, w, kern)
             return 0.5 * (out.astype(jnp.float32) ** 2).sum(), out
 
-        (loss, out_fwd), grad_tokens = jax.jit(jax.value_and_grad(loss_fn, has_aux=True))(
-            tokens, topk_idx, topk_w, kernels
-        )
-        grad_tokens.block_until_ready()
-        out_fwd.block_until_ready()
+        step_jit = jax.jit(jax.value_and_grad(loss_fn, has_aux=True))
 
-        if args.process_id == 0:
-            print(
-                f"[ep_moe] loss={float(loss):.4f} grad_tokens.shape={grad_tokens.shape} "
-                f"dp={args.dp_size} ep={args.ep_size} "
-                f"num_experts={args.num_experts} recv_pr={args.recv_capacity_per_rank}"
-            )
+        # Same jit + same inputs each iter: handle_mem cache must give identical loss/grad.
+        for it in range(args.iters):
+            (loss, out_fwd), grad_tokens = step_jit(tokens, topk_idx, topk_w, kernels)
+            grad_tokens.block_until_ready()
+            out_fwd.block_until_ready()
+            if args.process_id == 0:
+                print(
+                    f"[ep_moe] iter={it} loss={float(loss):.4f}"
+                    f" grad_tokens.shape={grad_tokens.shape}"
+                    f" dp={args.dp_size} ep={args.ep_size}"
+                    f" num_experts={args.num_experts} recv_pr={args.recv_capacity_per_rank}"
+                )
 
         if args.check:
 
@@ -347,7 +358,6 @@ def main():
             ref_out, ref_grad = _reference_grad(
                 tokens_global_np, topk_idx_global_np, w_global_np, kernels_np
             )
-            ref_loss = 0.5 * float((ref_out.astype(np.float32) ** 2).sum())
             # 3D global ``[num_procs, S, H]`` with num_procs = dp * ep. Each EP
             # column in a DP color sees identical inputs (and produces identical
             # outputs), so collapse the ep dim to one replica before flattening
@@ -363,15 +373,6 @@ def main():
                 .reshape(dp_size, ep_size, -1, ref_grad.shape[-1])[:, 0]
                 .reshape(-1, ref_grad.shape[-1])
             )
-            if args.process_id == 0:
-                fwd_diff = np.abs(global_out - ref_out)
-                grad_diff = np.abs(global_grad - ref_grad)
-                print(
-                    f"[ep_moe] DEBUG loss={float(loss):.4f} ref_loss(global)={ref_loss:.4f} "
-                    f"ratio={float(loss) / max(ref_loss, 1e-9):.4f} (expected ~1.0)"
-                )
-                print(f"[ep_moe] DEBUG fwd  max-abs-diff per row: {fwd_diff.max(axis=1)}")
-                print(f"[ep_moe] DEBUG grad max-abs-diff per row: {grad_diff.max(axis=1)}")
             np.testing.assert_allclose(
                 global_out,
                 ref_out,

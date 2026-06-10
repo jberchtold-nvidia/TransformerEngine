@@ -14,16 +14,22 @@ import numpy as np
 
 import transformer_engine_jax
 import transformer_engine.jax.cpp_extensions as tex
-from transformer_engine.jax.sharding import global_mesh_resource, get_mesh_axis_size
+from transformer_engine.jax.cpp_extensions.ep import _ep_outer_axis
+from transformer_engine.jax.cpp_extensions.misc import jax_dtype_to_te_dtype
+from transformer_engine.jax.sharding import (
+    global_mesh_resource,
+    get_mesh_axis_size,
+    with_sharding_constraint,
+)
 
 ep_prepare = tex.ep_prepare
-ep_make_handle = tex.ep_make_handle
-EpHandle = tex.EpHandle
+EpLayerConfig = tex.EpLayerConfig
+ep_handle_mem_size = tex.ep_handle_mem_size
 
 __all__ = [
-    "EpHandle",
+    "EpLayerConfig",
     "ep_bootstrap",
-    "ep_make_handle",
+    "ep_handle_mem_size",
     "ep_prepare",
     "ep_dispatch",
     "ep_combine",
@@ -63,108 +69,87 @@ def _allgather_uid(uid_arr, world_size, uid_size):
 # ── Bootstrap ────────────────────────────────────────────────────────────────
 
 
-_TE_DTYPE_FOR_NUMPY = {
-    np.dtype(np.uint8): transformer_engine_jax.DType.kByte,
-    np.dtype(np.int32): transformer_engine_jax.DType.kInt32,
-    np.dtype(np.int64): transformer_engine_jax.DType.kInt64,
-    np.dtype(np.float32): transformer_engine_jax.DType.kFloat32,
-    np.dtype(np.float16): transformer_engine_jax.DType.kFloat16,
-}
-
-
-def _to_te_dtype_int(dtype):
-    """Map jax/numpy dtype -> NVTEDType int. bf16 / fp8 / fp4 handled explicitly."""
-    if dtype is None:
-        return int(transformer_engine_jax.DType.kByte)
-    if dtype == jnp.bfloat16:
-        return int(transformer_engine_jax.DType.kBFloat16)
-    np_dtype = np.dtype(dtype)
-    if np_dtype in _TE_DTYPE_FOR_NUMPY:
-        return int(_TE_DTYPE_FOR_NUMPY[np_dtype])
-    raise ValueError(
-        f"ep_bootstrap: unsupported max_token_dtype={dtype!r}; supported = "
-        "uint8 / int32 / int64 / float32 / float16 / bfloat16."
-    )
-
-
 def ep_bootstrap(
     world_size,
     rank,
-    ep_size,
     num_experts,
     max_tokens_per_rank,
     recv_capacity_per_rank,
     hidden_dim,
+    max_token_dtype=jnp.bfloat16,
     max_num_sms=0,
-    allow_handle_mem_reloc=False,
-    max_token_dtype=None,
 ):
     """Initialize the EP communicator. Call once per process before any EP op.
 
+    Must run inside the active JAX Mesh and a global_shard_guard; ep_size and
+    num_ep_groups are read from the mesh axes named by MeshResource.ep_resource
+    and MeshResource.dp_resource/fsdp_resource.
+
+    max_token_dtype is the widest jnp dtype the group will dispatch; tensors
+    passed to ep_dispatch may use any narrower dtype.
     max_num_sms caps the SMs allotted to EP kernels (0 = auto).
-
-    Set ``allow_handle_mem_reloc=True`` only if the caller cannot guarantee a
-    stable ``handle_mem`` device pointer across calls (e.g. XLA-managed
-    buffers reallocated between JIT executables). Default raises on
-    relocation so callers detect handle-aliasing bugs.
-
-    ``max_token_dtype`` is the widest token dtype the group will dispatch
-    (sizes NCCL EP staging buffers at group create). Pass a jax/numpy
-    dtype, e.g. ``jnp.bfloat16``. Default ``None`` keeps the legacy ``kByte``
-    behavior, which only accepts 1-byte tensors.
     """
+    if jnp.dtype(max_token_dtype) != jnp.bfloat16:
+        raise NotImplementedError(
+            "ep_bootstrap: only max_token_dtype=jnp.bfloat16 is supported today, got"
+            f" {jnp.dtype(max_token_dtype)}."
+        )
     if world_size < 2:
         raise ValueError(
             f"ep_bootstrap requires world_size >= 2 (got {world_size}); NCCL EP needs"
             " at least 2 ranks to form a group."
         )
-    if world_size % ep_size != 0:
-        raise ValueError(
-            f"world_size ({world_size}) must be divisible by ep_size ({ep_size}); otherwise"
-            " some EP groups would have fewer than ep_size ranks and ncclCommInitRank would hang."
-        )
-    if num_experts % ep_size != 0:
-        raise ValueError(f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size}).")
     if jax.local_device_count() != 1:
         raise ValueError(
             "ep_bootstrap requires one local device per process (got"
             f" jax.local_device_count() = {jax.local_device_count()}); NCCL EP does not"
             " support single-process multi-device setups."
         )
+
+    gsr = global_mesh_resource()
+    ep_resource = gsr.ep_resource
+    if ep_resource is None:
+        raise ValueError(
+            "ep_bootstrap requires MeshResource.ep_resource to be set; enter a"
+            " global_shard_guard(MeshResource(..., ep_resource=<axis name>)) before bootstrap."
+        )
+    ep_size = get_mesh_axis_size(ep_resource)
+    outer_axis = _ep_outer_axis()
+    if outer_axis is None:
+        if world_size != ep_size:
+            raise ValueError(
+                f"ep_bootstrap: world_size ({world_size}) > ep_size ({ep_size}) but neither"
+                " MeshResource.dp_resource nor fsdp_resource is set; name the outer axis so"
+                " EP-output tensors can shard across EP groups."
+            )
+        num_ep_groups = 1
+    else:
+        num_ep_groups = get_mesh_axis_size(outer_axis)
+    if num_ep_groups * ep_size != world_size:
+        raise ValueError(
+            f"ep_bootstrap: num_ep_groups*ep_size ({num_ep_groups}*{ep_size}="
+            f"{num_ep_groups * ep_size}) must equal world_size ({world_size}); check that"
+            f" the '{outer_axis}' and '{ep_resource}' mesh axes cover all ranks."
+        )
+    if num_experts % ep_size != 0:
+        raise ValueError(f"num_experts ({num_experts}) must be divisible by ep_size ({ep_size}).")
+
     UID_SIZE = 128
     dp_color = rank // ep_size
     rank_within_group = rank % ep_size
     is_color_root = rank_within_group == 0
     if is_color_root:
-        try:
-            from nccl import get_unique_id
-
-            uid_bytes = bytes(get_unique_id())[:UID_SIZE]
-        except ImportError:
-            libnccl = ctypes.CDLL("libnccl.so.2", use_errno=True)
-            uid_arr = (ctypes.c_uint8 * UID_SIZE)()
-            ret = libnccl.ncclGetUniqueId(ctypes.cast(uid_arr, ctypes.c_void_p))
-            assert ret == 0, f"ncclGetUniqueId failed with code {ret}"
-            uid_bytes = bytes(uid_arr)
+        libnccl = ctypes.CDLL("libnccl.so.2", use_errno=True)
+        uid_arr = (ctypes.c_uint8 * UID_SIZE)()
+        ret = libnccl.ncclGetUniqueId(ctypes.cast(uid_arr, ctypes.c_void_p))
+        assert ret == 0, f"ncclGetUniqueId failed with code {ret}"
+        uid_bytes = bytes(uid_arr)
     else:
         uid_bytes = bytes(UID_SIZE)
 
     uid_arr = jnp.frombuffer(uid_bytes, dtype=jnp.uint8)
     all_uids = _allgather_uid(uid_arr, world_size, UID_SIZE)
     uid_bytes = bytes(np.asarray(all_uids[dp_color * ep_size]).tolist())
-
-    ep_resource = global_mesh_resource().ep_resource
-    if ep_resource is None:
-        raise ValueError(
-            "ep_bootstrap requires MeshResource.ep_resource to be set; enter a"
-            " global_shard_guard(MeshResource(..., ep_resource=<axis name>)) before bootstrap."
-        )
-    mesh_ep_size = get_mesh_axis_size(ep_resource)
-    if mesh_ep_size != ep_size:
-        raise ValueError(
-            f"ep_bootstrap: EpConfig.ep_size ({ep_size}) does not match mesh axis"
-            f" '{ep_resource}' size ({mesh_ep_size})."
-        )
 
     # Eager NCCL init while ranks are barrier-synced by the UID broadcast above.
     transformer_engine_jax.set_ep_bootstrap_params(
@@ -176,8 +161,7 @@ def ep_bootstrap(
         recv_capacity_per_rank,
         hidden_dim,
         max_num_sms=int(max_num_sms),
-        allow_handle_mem_reloc=int(bool(allow_handle_mem_reloc)),
-        max_token_dtype=_to_te_dtype_int(max_token_dtype),
+        max_token_dtype=int(jax_dtype_to_te_dtype(max_token_dtype)),
     )
 
     # Release the C++ anchor at interpreter shutdown so RAII can tear down NCCL.
@@ -191,6 +175,7 @@ def ep_bootstrap(
             world_size=world_size,
             rank=rank,
             ep_size=ep_size,
+            num_ep_groups=num_ep_groups,
             num_experts=num_experts,
             num_local_experts=num_experts // ep_size,
             max_tokens_per_rank=max_tokens_per_rank,
@@ -200,61 +185,64 @@ def ep_bootstrap(
     )
 
 
+def _default_out_partition_spec():
+    """Leading-axis default: ``(("dp","ep"),)`` if DP/FSDP is set, else ``("ep",)``."""
+    gsr = global_mesh_resource()
+    if gsr.ep_resource is None:
+        raise ValueError(
+            "ep_resource is not set on the active MeshResource; pass out_sharding=... explicitly."
+        )
+    outer = _ep_outer_axis()
+    leading = (outer, gsr.ep_resource) if outer is not None else gsr.ep_resource
+    return (leading,)
+
+
 # ── ep_dispatch (custom_vjp) ─────────────────────────────────────────────────
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(0, 4))
-def ep_dispatch(handle, topk_idx, tokens, topk_weights, recv_capacity_per_rank):
+def ep_dispatch(cfg, topk_idx, tokens, topk_weights, recv_capacity_per_rank):
     """Scatter tokens and weights to expert ranks.
 
-    ``handle`` is a per-layer ``EpHandle`` from ``ep_make_handle``; distinct
-    layers must hold distinct handles. Inputs are 2D ``[T, H]`` or 3D
-    ``[B, S, H]`` with only the leading dim sharded
-    (axis in {ep, (dp, ep), dp, None}). Returns
+    ``cfg`` is a per-layer ``EpLayerConfig``; distinct layers may share a
+    ``cfg`` (the pointer-keyed C++ cache keys on handle_mem, not on cfg).
+    Inputs are ``[..., H]`` with only the leading dim sharded as ``ep`` or
+    ``(dp, ep)``. Returns
     ``(recv_tokens, recv_topk_weights, handle_mem, token_counts)``; pass
     ``handle_mem`` and ``token_counts`` to the matching ``ep_combine``.
     """
-    return _dispatch_fwd(handle, topk_idx, tokens, topk_weights, recv_capacity_per_rank)[0]
+    return _dispatch_fwd(cfg, topk_idx, tokens, topk_weights, recv_capacity_per_rank)[0]
 
 
-def _dispatch_fwd(handle, topk_idx, tokens, topk_weights, recv_capacity_per_rank):
-    top_k = int(topk_weights.shape[-1])
-    token_counts, handle_mem = tex.ep_prepare(topk_idx, handle)
+def _dispatch_fwd(cfg, topk_idx, tokens, topk_weights, recv_capacity_per_rank):
+    if not jnp.issubdtype(topk_weights.dtype, jnp.floating):
+        raise TypeError(
+            f"ep_dispatch: topk_weights must be a floating dtype; got {topk_weights.dtype}."
+        )
+    token_counts, handle_mem = tex.ep_prepare(cfg, topk_idx)
     recv_tokens, recv_topk_weights = tex.ep_dispatch_fwd(
-        handle, handle_mem, topk_idx, tokens, topk_weights, recv_capacity_per_rank
+        cfg, handle_mem, topk_idx, tokens, topk_weights, recv_capacity_per_rank
     )
     out_leading = tuple(tokens.shape[:-1])
     primal = (recv_tokens, recv_topk_weights, handle_mem, token_counts)
-    return primal, (handle_mem, out_leading, top_k)
+    return primal, (handle_mem, out_leading)
 
 
-def _ep_outer_axis():
-    """Mirror of cpp_extensions.ep._ep_outer_axis (size-1 axes treated as absent)."""
-    gsr = global_mesh_resource()
-    if gsr.dp_resource is not None and get_mesh_axis_size(gsr.dp_resource) > 1:
-        return gsr.dp_resource
-    if gsr.fsdp_resource is not None and get_mesh_axis_size(gsr.fsdp_resource) > 1:
-        return gsr.fsdp_resource
-    return gsr.dp_resource or gsr.fsdp_resource
-
-
-def _dispatch_bwd(handle, recv_capacity_per_rank, res, g_outputs):
+def _dispatch_bwd(cfg, recv_capacity_per_rank, res, g_outputs):
     del recv_capacity_per_rank
-    handle_mem, out_leading, top_k = res
-    # Re-pin cotangent sharding: XLA transpose can drop the EP axis on a
-    # single-fwd-output cotangent, landing a global tensor in the FFI.
-    gsr = global_mesh_resource()
-    ep_axis = gsr.ep_resource
-    outer = _ep_outer_axis()
-    leading = (outer, ep_axis) if outer is not None else ep_axis
-    g_recv_tokens = jax.lax.with_sharding_constraint(
-        g_outputs[0], jax.sharding.PartitionSpec(leading, None, None)
-    )
-    g_recv_topk_weights = jax.lax.with_sharding_constraint(
-        g_outputs[1], jax.sharding.PartitionSpec(leading, None)
-    )
+    handle_mem, out_leading = res
+    # Re-pin cotangent: XLA transpose can drop the EP axis and feed the FFI a global tensor.
+    out_spec = _default_out_partition_spec()
+    spec = jax.sharding.PartitionSpec(*out_spec)
+    g_recv_tokens = with_sharding_constraint(g_outputs[0], spec)
+    g_recv_topk_weights = with_sharding_constraint(g_outputs[1], spec)
     grad_tokens, grad_topk_weights = tex.ep_dispatch_bwd(
-        handle, handle_mem, g_recv_tokens, g_recv_topk_weights, top_k, out_leading
+        cfg,
+        handle_mem,
+        g_recv_tokens,
+        g_recv_topk_weights,
+        out_leading,
+        out_partition_spec=out_spec,
     )
     return (None, grad_tokens, grad_topk_weights)
 
@@ -265,100 +253,59 @@ ep_dispatch.defvjp(_dispatch_fwd, _dispatch_bwd)
 # ── ep_combine (custom_vjp) ──────────────────────────────────────────────────
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(0, 5, 6))
+@partial(jax.custom_vjp, nondiff_argnums=(0, 4, 5))
 def ep_combine(
-    handle,
+    cfg,
     handle_mem,
     token_counts,
     expert_out,
-    recv_topk_weights,
     num_local_tokens,
     out_sharding=None,
 ):
-    """Reduce weighted expert outputs back to source ranks.
+    """Scatter-sum expert outputs back to source ranks. **Unweighted.**
 
-    Args:
-        handle:            ``EpHandle`` matching the ``ep_dispatch`` call.
-        handle_mem:        Routing-state buffer returned by ``ep_dispatch``.
-        token_counts:      ``[num_procs, num_local_experts]`` int32 (passed through).
-        expert_out:        ``[num_procs, recv_capacity_per_rank, H]`` post-FFN activations.
-        recv_topk_weights: ``[num_procs, recv_capacity_per_rank]`` float32 weights
-                           returned by ``ep_dispatch``.
-        num_local_tokens:  STATIC int or tuple. int -> 2D output ``[T, H]``;
-                           tuple -> N-D output ``[*tuple, H]``.
-        out_sharding:      STATIC optional ``PartitionSpec`` tuple for the
-                           output. Defaults to ``(("dp","ep"), *None)`` when
-                           DP is set, else ``("ep", *None)``. Only the leading
-                           dim may be sharded.
-
-    Returns:
-        ``[..., H]`` combined output shaped per ``num_local_tokens``.
+    Caller must pre-multiply ``expert_out`` by ``recv_topk_weights`` (and
+    zero padded slots); gradients w.r.t. weights flow through that hadamard,
+    not through this op. ``num_local_tokens`` is STATIC: int -> ``[T, H]``,
+    tuple -> ``[*tuple, H]``. ``out_sharding`` defaults via
+    ``_default_out_partition_spec``; only the leading dim may be sharded.
     """
     return _combine_fwd(
-        handle,
+        cfg,
         handle_mem,
         token_counts,
         expert_out,
-        recv_topk_weights,
         num_local_tokens,
         out_sharding,
     )[0]
 
 
-def _make_valid_mask(recv_topk_weights, dtype):
-    # recv_topk_weights == 0 marks a padded slot.
-    return (recv_topk_weights != 0).astype(dtype)[..., None]
-
-
 def _combine_fwd(
-    handle,
+    cfg,
     handle_mem,
     token_counts,
     expert_out,
-    recv_topk_weights,
     num_local_tokens,
     out_sharding,
 ):
     del token_counts
-    w = recv_topk_weights[..., None]
-    mask = _make_valid_mask(recv_topk_weights, jnp.float32)
-    weighted = (expert_out.astype(jnp.float32) * w * mask).astype(expert_out.dtype)
+    if out_sharding is None:
+        out_sharding = _default_out_partition_spec()
     result = tex.ep_combine_fwd(
-        handle, handle_mem, weighted, num_local_tokens, out_partition_spec=out_sharding
+        cfg, handle_mem, expert_out, num_local_tokens, out_partition_spec=out_sharding
     )
-    return result, (handle_mem, recv_topk_weights, expert_out)
+    return result, (handle_mem, expert_out.shape[-2])
 
 
-def _combine_bwd(handle, _num_local_tokens, _out_sharding, res, g_result):
-    handle_mem, recv_topk_weights, expert_out = res
-    # expert_out is [..., recv_pr, H]; pull recv_pr from the second-to-last dim.
-    recv_capacity_per_rank = expert_out.shape[-2]
-    # Re-pin cotangent sharding: same XLA-transpose workaround as _dispatch_bwd.
-    gsr = global_mesh_resource()
-    if _out_sharding is not None:
-        spec = jax.sharding.PartitionSpec(*_out_sharding)
-    else:
-        ep_axis = gsr.ep_resource
-        outer = _ep_outer_axis()
-        leading = (outer, ep_axis) if outer is not None and ep_axis is not None else ep_axis
-        spec = (
-            jax.sharding.PartitionSpec(leading, *([None] * (g_result.ndim - 1)))
-            if leading is not None
-            else None
-        )
-    if spec is not None:
-        g_result = jax.lax.with_sharding_constraint(g_result, spec)
-    grad_weighted = tex.ep_combine_bwd(handle, handle_mem, g_result, recv_capacity_per_rank)
-    w = recv_topk_weights[..., None]
-    mask = _make_valid_mask(recv_topk_weights, jnp.float32)
-    grad_weighted_f32 = grad_weighted.astype(jnp.float32)
-    grad_expert_out = (grad_weighted_f32 * w * mask).astype(grad_weighted.dtype)
-    grad_recv_topk_weights = (
-        (grad_weighted_f32 * expert_out.astype(jnp.float32) * mask)
-        .sum(axis=-1)
-        .astype(recv_topk_weights.dtype)
-    )
-    return (None, None, grad_expert_out, grad_recv_topk_weights)
+def _combine_bwd(cfg, _num_local_tokens, _out_sharding, res, g_result):
+    handle_mem, recv_capacity_per_rank = res
+    # Re-pin cotangent (same XLA-transpose workaround as _dispatch_bwd).
+    if _out_sharding is None:
+        _out_sharding = _default_out_partition_spec()
+    spec = jax.sharding.PartitionSpec(*_out_sharding)
+    g_result = with_sharding_constraint(g_result, spec)
+    grad_expert_out = tex.ep_combine_bwd(cfg, handle_mem, g_result, recv_capacity_per_rank)
+    return (None, None, grad_expert_out)
 
 
 ep_combine.defvjp(_combine_fwd, _combine_bwd)

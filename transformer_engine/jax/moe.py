@@ -119,23 +119,22 @@ def record_ep_bootstrap_signature_for_moe(
     )
 
 
-# Per-(top_k, alignment) EpHandle cache. ``tex.ep_make_handle`` mints a
-# fresh handle_id from a singleton pool capped at NVTE_EP_HANDLE_CACHE_SIZE
-# (default 8192); caching here keeps the pool steady across many jit traces
-# of the same MoE block configuration.
-_te_ep_handle_cache: Dict[Tuple[int, int], Any] = {}
+# Per-(top_k, alignment) EpLayerConfig cache. The C++ EP path now keys runtime
+# handle state by ``handle_mem`` while the Python config carries per-layer static
+# parameters through prepare / dispatch / combine.
+_te_ep_layer_config_cache: Dict[Tuple[int, int], Any] = {}
 
 
-def _get_or_make_ep_handle(top_k: int, dispatch_output_per_expert_alignment: int):
+def _get_or_make_ep_layer_config(top_k: int, dispatch_output_per_expert_alignment: int):
     key = (int(top_k), int(dispatch_output_per_expert_alignment))
-    h = _te_ep_handle_cache.get(key)
-    if h is None:
-        h = tex.ep_make_handle(
+    cfg = _te_ep_layer_config_cache.get(key)
+    if cfg is None:
+        cfg = tex.EpLayerConfig(
             top_k=key[0],
             dispatch_output_per_expert_alignment=key[1],
         )
-        _te_ep_handle_cache[key] = h
-    return h
+        _te_ep_layer_config_cache[key] = cfg
+    return cfg
 
 
 def _te_ep_assert_compatible_bootstrap(
@@ -180,7 +179,7 @@ def _te_ep_assert_compatible_bootstrap(
 
 
 # Registered as a pytree so jax.custom_vjp can flatten/unflatten it across
-# the fwd -> bwd boundary. ``handle`` is the only static field (EpHandle is
+# the fwd -> bwd boundary. ``ep_cfg`` is the only static field (EpLayerConfig is
 # a frozen dataclass of ints); the rest are jnp.ndarray, GroupedNoScaleTensor
 # (already a pytree), or None when aux_loss_coeff == 0.
 @register_pytree_node_class
@@ -194,7 +193,7 @@ class _Ctx:
     logits_2d: jnp.ndarray
     saved_scores: jnp.ndarray
     routing_map: jnp.ndarray
-    handle: Any
+    ep_cfg: Any
     handle_mem: Any
     token_counts: jnp.ndarray
     recv_topk_weights: jnp.ndarray
@@ -234,12 +233,12 @@ class _Ctx:
             self.aux_tokens_per_expert,
             self.aux_saved_scores,
         )
-        aux_data = (self.handle,)
+        aux_data = (self.ep_cfg,)
         return children, aux_data
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
-        (handle,) = aux_data
+        (ep_cfg,) = aux_data
         (
             x,
             gate_kernel,
@@ -269,7 +268,7 @@ class _Ctx:
             logits_2d=logits_2d,
             saved_scores=saved_scores,
             routing_map=routing_map,
-            handle=handle,
+            ep_cfg=ep_cfg,
             handle_mem=handle_mem,
             token_counts=token_counts,
             recv_topk_weights=recv_topk_weights,
@@ -718,10 +717,12 @@ def _moe_fwd_rule(
     topk_w_3d = jax.lax.with_sharding_constraint(topk_w_3d, NamedSharding(mesh, ep3_spec))
 
     # ---------------- TE EP dispatch (global view) ----------------
-    handle = _get_or_make_ep_handle(top_k=K, dispatch_output_per_expert_alignment=slots_per_expert)
-    token_counts, handle_mem = tex.ep_prepare(topk_idx_3d, handle)
+    ep_cfg = _get_or_make_ep_layer_config(
+        top_k=K, dispatch_output_per_expert_alignment=slots_per_expert
+    )
+    token_counts, handle_mem = tex.ep_prepare(ep_cfg, topk_idx_3d)
     recv_tokens, recv_topk_weights = tex.ep_dispatch_fwd(
-        handle, handle_mem, topk_idx_3d, x, topk_w_3d, recv_pr
+        ep_cfg, handle_mem, topk_idx_3d, x, topk_w_3d, recv_pr
     )
     recv_tokens = jax.lax.with_sharding_constraint(recv_tokens, NamedSharding(mesh, ep3_spec))
     recv_topk_weights = jax.lax.with_sharding_constraint(
@@ -809,7 +810,7 @@ def _moe_fwd_rule(
     if apply_topk_weights_early:
         # expert_outputs is already weighted upstream.
         output = tex.ep_combine_fwd(
-            handle,
+            ep_cfg,
             handle_mem,
             expert_outputs,
             num_local_tokens=(B, S),
@@ -827,7 +828,7 @@ def _moe_fwd_rule(
         mask_bool = (recv_topk_weights != 0)[..., None]
         weighted = jnp.where(mask_bool, expert_outputs * w, jnp.zeros_like(expert_outputs))
         output = tex.ep_combine_fwd(
-            handle,
+            ep_cfg,
             handle_mem,
             weighted,
             num_local_tokens=(B, S),
@@ -851,7 +852,7 @@ def _moe_fwd_rule(
         logits_2d=logits_2d,
         saved_scores=saved_scores,
         routing_map=routing_map,
-        handle=handle,
+        ep_cfg=ep_cfg,
         handle_mem=handle_mem,
         token_counts=token_counts,
         recv_topk_weights=recv_topk_weights,
@@ -928,7 +929,7 @@ def _moe_bwd_rule(
 
     # ---------------- Combine bwd (global view) ----------------
     d_output = jax.lax.with_sharding_constraint(d_output, NamedSharding(mesh, ep3_spec))
-    grad_pre_combine = tex.ep_combine_bwd(ctx.handle, ctx.handle_mem, d_output, recv_pr)
+    grad_pre_combine = tex.ep_combine_bwd(ctx.ep_cfg, ctx.handle_mem, d_output, recv_pr)
     grad_pre_combine = jax.lax.with_sharding_constraint(
         grad_pre_combine, NamedSharding(mesh, ep3_spec)
     )
@@ -1076,11 +1077,10 @@ def _moe_bwd_rule(
     d_sorted_x = jax.lax.with_sharding_constraint(d_sorted_x, NamedSharding(mesh, ep3_spec))
     d_recv_w_total = jax.lax.with_sharding_constraint(d_recv_w_total, NamedSharding(mesh, ep2_spec))
     d_x_from_dispatch, d_topk_w = tex.ep_dispatch_bwd(
-        ctx.handle,
+        ctx.ep_cfg,
         ctx.handle_mem,
         d_sorted_x,
         d_recv_w_total,
-        top_k=K,
         num_local_tokens=(B, S),
         out_partition_spec=out_partition_spec,
     )

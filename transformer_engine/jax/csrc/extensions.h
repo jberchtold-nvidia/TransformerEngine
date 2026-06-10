@@ -205,13 +205,14 @@ XLA_FFI_DECLARE_HANDLER_SYMBOL(FusedMoEAuxLossForwardHandler);
 XLA_FFI_DECLARE_HANDLER_SYMBOL(FusedMoEAuxLossBackwardHandler);
 
 // Bootstrap EP (eager NCCL comm init); anchor released by ReleaseEpResources.
+// max_token_dtype is the NVTEDType enum value (int) for the widest token dtype
+// the group will dispatch.
 void SetEpBootstrapParams(pybind11::bytes unique_id_bytes, int ep_size, int rank_within_group,
                           int num_experts, int max_tokens_per_rank, int max_recv_tokens_per_rank,
-                          int hidden_dim, int max_num_sms, int allow_handle_mem_reloc,
-                          int max_token_dtype);
+                          int hidden_dim, int max_num_sms, int max_token_dtype);
 void ReleaseEpResources();
-// Register an EP layer; returns (handle_id, handle_mem_size).
-pybind11::tuple EpRegisterLayer(int top_k, size_t dispatch_output_per_expert_alignment);
+// Return the handle_mem byte size for a layer config.
+size_t EpHandleMemSize(int top_k, size_t dispatch_output_per_expert_alignment);
 
 // EpInstanceState type_id / type_info capsules for jax.ffi.register_ffi_type.
 pybind11::capsule GetEpInstanceStateTypeIdCapsule();

@@ -234,12 +234,10 @@ def mesh():
         ep_bootstrap(
             world_size=num_procs,
             rank=jax.process_index(),
-            ep_size=EP_SIZE,
             num_experts=NUM_EXPERTS,
             max_tokens_per_rank=max_tokens_per_rank,
             recv_capacity_per_rank=recv_capacity_per_rank,
             hidden_dim=HIDDEN,
-            allow_handle_mem_reloc=True,
             max_token_dtype=DTYPE,
         )
     record_ep_bootstrap_signature_for_moe(

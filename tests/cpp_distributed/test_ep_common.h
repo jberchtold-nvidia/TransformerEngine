@@ -40,7 +40,7 @@ using transformer_engine::TensorWrapper;
     NVTE_CHECK(_err_mpi == MPI_SUCCESS, "MPI error: ", _err_mpi);  \
   } while (false)
 
-// ── Process-level state ───────────────────────────────────────────────────────
+// -- Process-level state -------------------------------------------------------
 
 static int         g_process_id          = -1;
 static int         g_num_processes       = -1;
@@ -77,7 +77,7 @@ struct DevBuf {
   size_t bytes() const { return count * sizeof(T); }
 };
 
-// ── Shared routing helper ─────────────────────────────────────────────────────
+// -- Shared routing helper -----------------------------------------------------
 
 // Balanced round-robin routing: token t on rank r maps top_k experts to
 //   (r * num_local_experts + t * top_k + k) % num_experts
@@ -90,14 +90,14 @@ static inline std::vector<int64_t> routing_balanced(
   return idx;
 }
 
-// ── ncclUniqueId exchange via MPI ─────────────────────────────────────────────
+// -- ncclUniqueId exchange via MPI ---------------------------------------------
 
 static void exchange_unique_id(ncclUniqueId* uid) {
   if (g_process_id == 0) NVTE_CHECK_NCCL(ncclGetUniqueId(uid));
   CHECK_MPI(MPI_Bcast(uid, sizeof(*uid), MPI_BYTE, 0, MPI_COMM_WORLD));
 }
 
-// ── CLI parsing ───────────────────────────────────────────────────────────────
+// -- CLI parsing ---------------------------------------------------------------
 
 static void ep_parse_args(int argc, char* argv[]) {
   for (int i = 1; i < argc; ++i) {
@@ -107,7 +107,7 @@ static void ep_parse_args(int argc, char* argv[]) {
   }
 }
 
-// ── Bootstrap / teardown ──────────────────────────────────────────────────────
+// -- Bootstrap / teardown ------------------------------------------------------
 
 // Returns false if the binary should exit without running tests (wrong SM, etc.).
 static bool ep_bootstrap(int argc, char* argv[]) {
@@ -165,6 +165,22 @@ static bool ep_bootstrap(int argc, char* argv[]) {
 
   g_ep_initialized = true;
   return true;
+}
+
+// Re-bootstrap the EP backend on the existing g_ep_comm with a new zero_copy
+// setting.
+static void ep_reinitialize(int zero_copy) {
+  if (!g_ep_initialized) return;
+  nvte_ep_shutdown();
+  NVTEEpGroupConfig group_config{};
+  group_config.ep_size                  = g_ep_size;
+  group_config.num_experts              = g_num_experts;
+  group_config.max_tokens_per_rank      = g_max_tokens_per_rank;
+  group_config.max_recv_tokens_per_rank = g_ep_size * g_max_tokens_per_rank * 2;
+  group_config.hidden_dim               = g_hidden_dim;
+  group_config.max_token_dtype          = g_max_token_dtype;
+  group_config.zero_copy                = zero_copy;
+  nvte_ep_initialize(static_cast<void*>(g_ep_comm), group_config);
 }
 
 // Tear down in dependency order: backend's ep_group reads from ep_comm,
