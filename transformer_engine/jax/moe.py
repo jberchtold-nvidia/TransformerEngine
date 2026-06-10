@@ -224,8 +224,7 @@ class _Ctx:
     token_counts: jnp.ndarray
     recv_topk_weights: jnp.ndarray
     casted_sorted_x_lhs_trans: Any
-    casted_wi_0_rhs_trans: Any
-    casted_wi_1_rhs_trans: Any
+    casted_wi_rhs_trans: Any
     gate_proj_out: jnp.ndarray
     up_proj_out: jnp.ndarray
     casted_intermediate_lhs_trans: Any
@@ -249,8 +248,7 @@ class _Ctx:
             self.token_counts,
             self.recv_topk_weights,
             self.casted_sorted_x_lhs_trans,
-            self.casted_wi_0_rhs_trans,
-            self.casted_wi_1_rhs_trans,
+            self.casted_wi_rhs_trans,
             self.gate_proj_out,
             self.up_proj_out,
             self.casted_intermediate_lhs_trans,
@@ -278,8 +276,7 @@ class _Ctx:
             token_counts,
             recv_topk_weights,
             casted_sorted_x_lhs_trans,
-            casted_wi_0_rhs_trans,
-            casted_wi_1_rhs_trans,
+            casted_wi_rhs_trans,
             gate_proj_out,
             up_proj_out,
             casted_intermediate_lhs_trans,
@@ -302,8 +299,7 @@ class _Ctx:
             token_counts=token_counts,
             recv_topk_weights=recv_topk_weights,
             casted_sorted_x_lhs_trans=casted_sorted_x_lhs_trans,
-            casted_wi_0_rhs_trans=casted_wi_0_rhs_trans,
-            casted_wi_1_rhs_trans=casted_wi_1_rhs_trans,
+            casted_wi_rhs_trans=casted_wi_rhs_trans,
             gate_proj_out=gate_proj_out,
             up_proj_out=up_proj_out,
             casted_intermediate_lhs_trans=casted_intermediate_lhs_trans,
@@ -353,41 +349,42 @@ def _ffn_fwd_per_shard(
     wi_1 = wi_1.astype(sorted_x.dtype)
     wo = wo.astype(sorted_x.dtype)
 
+    # wi GEMM uses ONE fused grouped_gemm with the gate/up weights
+    # concatenated along the trailing (output) axis: wi_combined has
+    # shape ``(num_local_experts, hidden, 2*H_inter)`` and the resulting
+    # combined_out has shape ``(num_rows, 2*H_inter)``, which jnp.split
+    # cleanly slices back into gate / up halves. tex.grouped_gemm only
+    # supports the canonical (G, K, N) 3D weight layout with
+    # contracting_dims=((1,),(1,)) -- see the docstring on
+    # transformer_engine.jax.dense.grouped_dense ("currently only
+    # supports ((1,), (1,))") and the CI test
+    # tests/jax/test_multi_process_distributed_grouped_gemm.py.
+    # An older fused 4D variant built via jnp.stack([wi_0, wi_1], axis=-2)
+    # put a non-contracting axis in the middle of the RHS, which the
+    # kernel walked as if it were 3D and read off the end -> NaN.
+    # Confirmed via TE_MOE_INSPECT bisect: the stack-axis variant
+    # produced all-NaN output, while the concat-axis variant (this
+    # path) produces finite outputs matching the jnp.einsum reference.
+    wi_combined = jnp.concatenate([wi_0, wi_1], axis=-1)
+    wi_combined_bias = (
+        jnp.concatenate([wi_0_bias, wi_1_bias], axis=-1) if wi_0_bias is not None else None
+    )
+
     q_set = noop_quantizer_set
-    # wi GEMM uses TWO separate 3D grouped_gemm calls (one per wi_0 / wi_1)
-    # instead of one fused 4D call. tex.grouped_gemm only supports the
-    # canonical (G, K, N) 3D weight layout with contracting_dims=((1,),(1,))
-    # -- see the docstring on transformer_engine.jax.dense.grouped_dense
-    # ("currently only supports ((1,), (1,))") and the CI test
-    # tests/jax/test_multi_process_distributed_grouped_gemm.py. A 4D
-    # weight built via jnp.stack([wi_0, wi_1], axis=-2) puts a
-    # non-contracting axis in the middle of the RHS, which the kernel
-    # walks as if it were 3D and reads off the end -> NaN. Confirmed
-    # via TE_MOE_INSPECT bisect: clean LHS + clean fused-4D RHS still
-    # produced all-NaN output, while the same inputs through two
-    # 3D calls produced finite outputs matching the jnp.einsum reference.
     sorted_x = _inspect(sorted_x, "ffn_fwd/sorted_x_in")
     casted_sorted_x = tex.grouped_quantize(sorted_x, q_set.x, local_group_sizes, flatten_axis=-1)
-    casted_wi_0 = tex.grouped_quantize(wi_0, q_set.kernel, flatten_axis=-1)
-    casted_wi_1 = tex.grouped_quantize(wi_1, q_set.kernel, flatten_axis=-1)
-    _casted_x_lhs = casted_sorted_x.get_tensor(usage=TensorUsage.LHS)
-    gate_proj_out = tex.grouped_gemm(
-        _casted_x_lhs,
-        casted_wi_0.get_tensor(usage=TensorUsage.RHS),
+    casted_wi = tex.grouped_quantize(wi_combined, q_set.kernel, flatten_axis=-1)
+    combined_out = tex.grouped_gemm(
+        casted_sorted_x.get_tensor(usage=TensorUsage.LHS),
+        casted_wi.get_tensor(usage=TensorUsage.RHS),
         contracting_dims=((1,), (1,)),
-        bias=wi_0_bias,
+        bias=wi_combined_bias,
     )
-    up_proj_out = tex.grouped_gemm(
-        _casted_x_lhs,
-        casted_wi_1.get_tensor(usage=TensorUsage.RHS),
-        contracting_dims=((1,), (1,)),
-        bias=wi_1_bias,
-    )
+    gate_proj_out, up_proj_out = jnp.split(combined_out, 2, axis=-1)
     gate_proj_out = _inspect(gate_proj_out, "ffn_fwd/gate_proj_out")
     up_proj_out = _inspect(up_proj_out, "ffn_fwd/up_proj_out")
     casted_sorted_x_lhs_trans = casted_sorted_x.get_tensor(usage=TensorUsage.LHS_TRANS)
-    casted_wi_0_rhs_trans = casted_wi_0.get_tensor(usage=TensorUsage.RHS_TRANS)
-    casted_wi_1_rhs_trans = casted_wi_1.get_tensor(usage=TensorUsage.RHS_TRANS)
+    casted_wi_rhs_trans = casted_wi.get_tensor(usage=TensorUsage.RHS_TRANS)
 
     # Promote the silu+multiply to fp32 to match the pure-JAX reference
     # (and ML common practice). bf16 silu accumulation alone drifts ~1%
@@ -429,8 +426,7 @@ def _ffn_fwd_per_shard(
     expert_outputs_3d = expert_outputs.reshape(1, expert_outputs.shape[0], expert_outputs.shape[1])
     residuals = (
         casted_sorted_x_lhs_trans,
-        casted_wi_0_rhs_trans,
-        casted_wi_1_rhs_trans,
+        casted_wi_rhs_trans,
         gate_proj_out,
         up_proj_out,
         casted_intermediate_lhs_trans,
@@ -443,8 +439,7 @@ def _ffn_fwd_per_shard(
 def _ffn_bwd_per_shard(
     d_expert_outputs_local: jnp.ndarray,
     casted_sorted_x_lhs_trans,
-    casted_wi_0_rhs_trans,
-    casted_wi_1_rhs_trans,
+    casted_wi_rhs_trans,
     gate_proj_out: jnp.ndarray,
     up_proj_out: jnp.ndarray,
     casted_intermediate_lhs_trans,
@@ -522,46 +517,32 @@ def _ffn_bwd_per_shard(
     d_up_proj_out = _inspect(d_up_proj_out, "ffn_bwd/d_up_proj_out_after_act_bwd")
     d_gate_proj_out = _inspect(d_gate_proj_out, "ffn_bwd/d_gate_proj_out_after_act_bwd")
 
-    # wi bwd (split gate/up). Two separate 3D grouped_gemm calls each
-    # for d_sorted_x and d_w_i, mirroring the un-fused fwd. The fused
-    # 4D path was buggy in fwd (NaN-from-clean-inputs); the same
-    # ((1,2),(2,3)) bwd shape on a 4D RHS would silently produce NaN
-    # too if it ever fired on clean inputs.
-    d_gate_proj_out_b = d_gate_proj_out.astype(gate_proj_out.dtype)
-    d_up_proj_out_b = d_up_proj_out.astype(up_proj_out.dtype)
-    casted_d_gate = tex.grouped_quantize(
-        d_gate_proj_out_b, q_set.dgrad, local_group_sizes, flatten_axis=-1
+    # wi bwd (fused gate/up via concat). Mirror the fused fwd: pack the
+    # gate/up cotangents along the trailing axis, run a single
+    # grouped_quantize + two grouped_gemm pair (one dgrad, one wgrad)
+    # against the fused casted_wi_rhs_trans residual, then split the
+    # wgrad result back into d_wi_0 / d_wi_1 halves with jnp.split.
+    d_combined = jnp.concatenate([d_gate_proj_out, d_up_proj_out], axis=-1)
+    casted_d_combined = tex.grouped_quantize(
+        d_combined, q_set.dgrad, local_group_sizes, flatten_axis=-1
     )
-    casted_d_up = tex.grouped_quantize(
-        d_up_proj_out_b, q_set.dgrad, local_group_sizes, flatten_axis=-1
-    )
-    d_sorted_x_from_gate = tex.grouped_gemm(
-        casted_d_gate.get_tensor(usage=TensorUsage.LHS),
-        casted_wi_0_rhs_trans,
+    d_sorted_x = tex.grouped_gemm(
+        casted_d_combined.get_tensor(usage=TensorUsage.LHS),
+        casted_wi_rhs_trans,
         contracting_dims=((1,), (2,)),
     )
-    d_sorted_x_from_up = tex.grouped_gemm(
-        casted_d_up.get_tensor(usage=TensorUsage.LHS),
-        casted_wi_1_rhs_trans,
-        contracting_dims=((1,), (2,)),
-    )
-    d_sorted_x = d_sorted_x_from_gate + d_sorted_x_from_up
     d_sorted_x = _inspect(d_sorted_x, "ffn_bwd/d_sorted_x_after_wi_dgrad_sum")
-    d_wi_0 = tex.grouped_gemm(
+    d_wi_combined = tex.grouped_gemm(
         casted_sorted_x_lhs_trans,
-        casted_d_gate.get_tensor(usage=TensorUsage.RHS),
+        casted_d_combined.get_tensor(usage=TensorUsage.RHS),
         contracting_dims=((0,), (0,)),
     )
-    d_wi_1 = tex.grouped_gemm(
-        casted_sorted_x_lhs_trans,
-        casted_d_up.get_tensor(usage=TensorUsage.RHS),
-        contracting_dims=((0,), (0,)),
-    )
+    d_wi_0, d_wi_1 = jnp.split(d_wi_combined, 2, axis=-1)
     d_wi_0 = _inspect(d_wi_0, "ffn_bwd/d_wi_0_after_wgrad_pre_psum")
     d_wi_1 = _inspect(d_wi_1, "ffn_bwd/d_wi_1_after_wgrad_pre_psum")
     if has_bias:
-        d_wi_0_bias = tex.grouped_dbias(d_gate_proj_out_b, local_group_sizes)
-        d_wi_1_bias = tex.grouped_dbias(d_up_proj_out_b, local_group_sizes)
+        d_wi_combined_bias = tex.grouped_dbias(d_combined, local_group_sizes)
+        d_wi_0_bias, d_wi_1_bias = jnp.split(d_wi_combined_bias, 2, axis=-1)
     else:
         d_wi_0_bias = None
         d_wi_1_bias = None
@@ -819,12 +800,13 @@ def _moe_fwd_rule(
 
     # FFN residuals live entirely on the local ep rank, so the leading
     # "experts" / "rows" dims map to P() (already shard-local). wi is
-    # un-fused into wi_0 / wi_1 (see _ffn_fwd_per_shard for rationale);
-    # each carries its own RHS_TRANS residual.
+    # fused via jnp.concatenate along the trailing (output) axis
+    # (see _ffn_fwd_per_shard for rationale), so the residual is a
+    # single 3D casted_wi_rhs_trans of shape
+    # (num_local_experts, hidden, 2*H_inter).
     residuals_spec = (
         P(),                    # casted_sorted_x_lhs_trans
-        P(ep_axis, None, None), # casted_wi_0_rhs_trans
-        P(ep_axis, None, None), # casted_wi_1_rhs_trans
+        P(ep_axis, None, None), # casted_wi_rhs_trans
         P(),                    # gate_proj_out
         P(),                    # up_proj_out
         P(),                    # casted_intermediate_lhs_trans
@@ -921,8 +903,7 @@ def _moe_fwd_rule(
 
     (
         casted_sorted_x_lhs_trans,
-        casted_wi_0_rhs_trans,
-        casted_wi_1_rhs_trans,
+        casted_wi_rhs_trans,
         gate_proj_out,
         up_proj_out,
         casted_intermediate_lhs_trans,
@@ -942,8 +923,7 @@ def _moe_fwd_rule(
         token_counts=token_counts,
         recv_topk_weights=recv_topk_weights,
         casted_sorted_x_lhs_trans=casted_sorted_x_lhs_trans,
-        casted_wi_0_rhs_trans=casted_wi_0_rhs_trans,
-        casted_wi_1_rhs_trans=casted_wi_1_rhs_trans,
+        casted_wi_rhs_trans=casted_wi_rhs_trans,
         gate_proj_out=gate_proj_out,
         up_proj_out=up_proj_out,
         casted_intermediate_lhs_trans=casted_intermediate_lhs_trans,
@@ -1075,8 +1055,7 @@ def _moe_bwd_rule(
     bwd_in_specs = (
         ep3_spec,                # d_expert_outputs
         P(),                     # casted_sorted_x_lhs_trans
-        P(ep_axis, None, None),  # casted_wi_0_rhs_trans
-        P(ep_axis, None, None),  # casted_wi_1_rhs_trans
+        P(ep_axis, None, None),  # casted_wi_rhs_trans
         P(),                     # gate_proj_out
         P(),                     # up_proj_out
         P(),                     # casted_intermediate_lhs_trans
@@ -1087,8 +1066,7 @@ def _moe_bwd_rule(
     bwd_in_args = [
         d_expert_outputs,
         ctx.casted_sorted_x_lhs_trans,
-        ctx.casted_wi_0_rhs_trans,
-        ctx.casted_wi_1_rhs_trans,
+        ctx.casted_wi_rhs_trans,
         ctx.gate_proj_out,
         ctx.up_proj_out,
         ctx.casted_intermediate_lhs_trans,
