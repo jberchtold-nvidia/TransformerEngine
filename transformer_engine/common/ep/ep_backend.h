@@ -5,12 +5,7 @@
  ************************************************************************/
 
 /*! \file ep_backend.h
- *  \brief Internal NCCL EP singleton; not part of the public API.
- *
- *  ncclEpHandles are cached by handle_mem device pointer. nvte_ep_prepare
- *  seeds the entry with the layer_cfg; dispatch/combine/_bwd look up by
- *  pointer. Cache cap: NVTE_EP_HANDLE_CACHE_SIZE (default 4096; -1 disables
- *  LRU eviction).
+ *  \brief Internal NCCL EP singleton; not part of the public API. See ep.h.
  */
 
 #ifndef TRANSFORMER_ENGINE_COMMON_EP_EP_BACKEND_H_
@@ -21,6 +16,7 @@
 #include <nccl_ep.h>
 #include <transformer_engine/ep.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <list>
@@ -50,8 +46,9 @@ class EPBackend {
   size_t handle_mem_size(NVTEEpLayerConfig layer_cfg);
 
   // Seeds the cache for handle_mem with layer_cfg and runs the routing AllGather.
-  void prepare(void* handle_mem, const NVTETensor topk_idx, NVTETensor token_counts,
-               NVTEEpLayerConfig layer_cfg, cudaStream_t stream);
+  void prepare(void* handle_mem, const NVTETensor topk_idx, NVTETensor recv_tokens_per_expert,
+               NVTETensor total_recv_tokens_per_rank, NVTEEpLayerConfig layer_cfg,
+               cudaStream_t stream);
 
   // Per-step ops below require a prior prepare().
   void dispatch(void* handle_mem, const NVTETensor topk_idx, const NVTETensor tokens,
@@ -101,7 +98,7 @@ class EPBackend {
   ncclEpGroup_t ep_group_{nullptr};
   ncclComm_t ep_comm_{nullptr};
   NVTEEpGroupConfig group_config_{};
-  bool initialized_{false};
+  std::atomic<bool> initialized_{false};
   std::mutex mutex_;
   std::list<HandleEntry> lru_;
   std::unordered_map<void*, std::list<HandleEntry>::iterator> index_;

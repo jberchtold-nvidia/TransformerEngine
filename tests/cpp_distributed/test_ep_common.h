@@ -80,13 +80,14 @@ struct DevBuf {
 // -- Shared routing helper -----------------------------------------------------
 
 // Balanced round-robin routing: token t on rank r maps top_k experts to
-//   (r * num_local_experts + t * top_k + k) % num_experts
+//   (r * num_tokens * top_k + t * top_k + k) % num_experts
+// i.e. a single global counter over all (rank, t, k) triples mod num_experts.
 static inline std::vector<int64_t> routing_balanced(
-    int rank, int num_tokens, int top_k, int num_experts, int num_local_experts) {
+    int rank, int num_tokens, int top_k, int num_experts, int /*num_local_experts*/) {
   std::vector<int64_t> idx(num_tokens * top_k);
   for (int t = 0; t < num_tokens; ++t)
     for (int k = 0; k < top_k; ++k)
-      idx[t * top_k + k] = (rank * num_local_experts + t * top_k + k) % num_experts;
+      idx[t * top_k + k] = (rank * num_tokens * top_k + t * top_k + k) % num_experts;
   return idx;
 }
 
@@ -145,7 +146,7 @@ static bool ep_bootstrap(int argc, char* argv[]) {
   ncclUniqueId uid{};
   exchange_unique_id(&uid);
 
-  NVTEEpGroupConfig group_config{};
+  NVTEEpGroupConfig group_config = NVTE_EP_GROUP_CONFIG_INIT;
   group_config.ep_size                  = g_ep_size;
   group_config.num_experts              = g_num_experts;
   group_config.max_tokens_per_rank      = g_max_tokens_per_rank;
@@ -155,7 +156,7 @@ static bool ep_bootstrap(int argc, char* argv[]) {
   group_config.max_token_dtype          = g_max_token_dtype;
 
   NVTE_CHECK_NCCL(ncclCommInitRank(&g_ep_comm, g_num_processes, uid, g_process_id));
-  nvte_ep_initialize(static_cast<void*>(g_ep_comm), group_config);
+  nvte_ep_initialize(static_cast<void*>(g_ep_comm), &group_config);
 
   if (g_process_id == 0) {
     printf("EP initialized: ep_size=%d num_experts=%d "
@@ -172,7 +173,7 @@ static bool ep_bootstrap(int argc, char* argv[]) {
 static void ep_reinitialize(int zero_copy) {
   if (!g_ep_initialized) return;
   nvte_ep_shutdown();
-  NVTEEpGroupConfig group_config{};
+  NVTEEpGroupConfig group_config = NVTE_EP_GROUP_CONFIG_INIT;
   group_config.ep_size                  = g_ep_size;
   group_config.num_experts              = g_num_experts;
   group_config.max_tokens_per_rank      = g_max_tokens_per_rank;
@@ -180,7 +181,7 @@ static void ep_reinitialize(int zero_copy) {
   group_config.hidden_dim               = g_hidden_dim;
   group_config.max_token_dtype          = g_max_token_dtype;
   group_config.zero_copy                = zero_copy;
-  nvte_ep_initialize(static_cast<void*>(g_ep_comm), group_config);
+  nvte_ep_initialize(static_cast<void*>(g_ep_comm), &group_config);
 }
 
 // Tear down in dependency order: backend's ep_group reads from ep_comm,

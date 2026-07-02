@@ -23,7 +23,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 
 import transformer_engine_jax
 from .base import BasePrimitive, register_primitive
-from ..sharding import global_mesh_resource, get_mesh_axis_size
+from ..sharding import global_mesh_resource
 
 __all__ = [
     "EpConfig",
@@ -125,15 +125,8 @@ def _ep_outer_axis():
 
     When set, EP-output globals carry an extra leading ``dp_size`` dim so SPMD
     sees each DP color's slab as distinct (rather than replicated across DP).
-
-    A dp/fsdp axis that is sized 1 in the active mesh is treated as absent so
-    we don't pin EP-output specs to a degenerate axis that JAX may collapse.
     """
     gsr = global_mesh_resource()
-    if gsr.dp_resource is not None and get_mesh_axis_size(gsr.dp_resource) > 1:
-        return gsr.dp_resource
-    if gsr.fsdp_resource is not None and get_mesh_axis_size(gsr.fsdp_resource) > 1:
-        return gsr.fsdp_resource
     return gsr.dp_resource or gsr.fsdp_resource
 
 
@@ -579,9 +572,13 @@ class EpCombinePrimitive(BasePrimitive):
                 " None, None) (or ((dp, ep), None, None) when dp/fsdp is set)"
                 f" over [num_procs, recv_pr, H]; got spec={eo_spec}."
             )
-        per_shard_leading = _leading_per_shard(out_leading_shape, out_partition_spec[0], mesh)
+        if out_partition_spec is not None:
+            per_shard_leading = _leading_per_shard(out_leading_shape, out_partition_spec[0], mesh)
+            out_sharding = NamedSharding(mesh, PartitionSpec(*out_partition_spec))
+        else:
+            per_shard_leading = out_leading_shape
+            out_sharding = NamedSharding(mesh, PartitionSpec())
         arg_shardings = tuple(a.sharding for a in arg_infos)
-        out_sharding = NamedSharding(mesh, PartitionSpec(*out_partition_spec))
 
         def sharded_impl(handle_mem, expert_out):
             return EpCombinePrimitive.impl(
@@ -730,9 +727,13 @@ class EpDispatchBwdPrimitive(BasePrimitive):
                 "EpDispatchBwd: grad and g_recv_topk_weights must share the leading"
                 f" axis; got grad={g_spec}, g_recv_topk_weights={gw_spec}."
             )
-        per_shard_leading = _leading_per_shard(out_leading_shape, out_partition_spec[0], mesh)
+        if out_partition_spec is not None:
+            per_shard_leading = _leading_per_shard(out_leading_shape, out_partition_spec[0], mesh)
+            out_sharding = NamedSharding(mesh, PartitionSpec(*out_partition_spec))
+        else:
+            per_shard_leading = out_leading_shape
+            out_sharding = NamedSharding(mesh, PartitionSpec())
         arg_shardings = tuple(a.sharding for a in arg_infos)
-        out_sharding = NamedSharding(mesh, PartitionSpec(*out_partition_spec))
         out_shardings = [out_sharding, out_sharding]
 
         def sharded_impl(handle_mem, grad, g_recv_topk_weights):
