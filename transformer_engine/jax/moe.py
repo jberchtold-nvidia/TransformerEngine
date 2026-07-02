@@ -634,7 +634,7 @@ def _moe_fwd_rule(
     # ---------------- TE EP dispatch (global view) ----------------
     cfg = tex.EpLayerConfig(
         top_k=K,
-        dispatch_output_per_expert_alignment=slots_per_expert,
+        dispatch_output_per_expert_alignment=_ALIGN_SIZE,
     )
     token_counts, handle_mem = tex.ep_prepare(cfg, topk_idx_3d)
     recv_tokens, recv_topk_weights = tex.ep_dispatch_fwd(
