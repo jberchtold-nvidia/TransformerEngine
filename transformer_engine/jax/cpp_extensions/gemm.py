@@ -1901,9 +1901,14 @@ class GroupedGemmPrimitive(BasePrimitive):
             lhs_data_spec = list(lhs_data_spec)
             for out_idx, lhs_dim in enumerate(lhs_non_contracting_dims, start=1):
                 if out_idx < len(out_spec):
-                    lhs_data_spec[lhs_dim] = merge_axis_specs(
-                        lhs_data_spec[lhs_dim], out_spec[out_idx]
+                    other_lhs_axes = spec_axes(
+                        tuple(spec for idx, spec in enumerate(lhs_data_spec) if idx != lhs_dim)
                     )
+                    out_axes = out_spec[out_idx]
+                    out_axes = out_axes if isinstance(out_axes, tuple) else (out_axes,)
+                    out_axes = tuple(axis for axis in out_axes if axis not in other_lhs_axes)
+                    out_axes = None if len(out_axes) == 0 else out_axes
+                    lhs_data_spec[lhs_dim] = merge_axis_specs(lhs_data_spec[lhs_dim], out_axes)
             lhs_data_spec = tuple(lhs_data_spec)
 
         final_arg_specs = (
