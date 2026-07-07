@@ -945,7 +945,7 @@ def _moe_bwd_rule(
     # T-sharded routing-side d_logits via JAX's normal broadcast.
     if aux_loss_coeff > 0.0:
         T_global = ctx.logits_2d.shape[0]
-        d_aux_loss_scalar = d_aux_loss.reshape(()).astype(jnp.float32)
+        d_aux_loss_scalar = d_aux_loss.reshape((1,)).astype(jnp.float32)
         d_aux_probs = tex.fused_moe_aux_loss_bwd(
             ctx.aux_const_buf,
             ctx.aux_tokens_per_expert.astype(jnp.int32),
