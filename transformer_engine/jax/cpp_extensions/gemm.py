@@ -222,9 +222,11 @@ def _get_nvfp4_tensor_scale_inv(amax):
     return amax / (DATA_DTYPE_MAX * SCALE_DTYPE_MAX)
 
 
-def _warn_if_axes_ignored(arg_name, original_spec, partition_spec):
+def _warn_if_axes_ignored(arg_name, original_spec, partition_spec, consumed_axes=()):
     ignored_axes = tuple(
-        axis for axis in spec_axes(original_spec) if axis not in spec_axes(partition_spec)
+        axis
+        for axis in spec_axes(original_spec)
+        if axis not in spec_axes(partition_spec) and axis not in consumed_axes
     )
     if ignored_axes:
         warnings.warn(
@@ -1926,7 +1928,23 @@ class GroupedGemmPrimitive(BasePrimitive):
             additional_arg_0_spec,
             additional_arg_1_spec,
         )
-        for arg_name, original_spec, partition_spec in zip(
+        fsdp_consumed_axes = (fsdp_axis,) if gather_rhs_fsdp else ()
+        consumed_axes_by_arg = (
+            (),
+            (),
+            fsdp_consumed_axes,
+            fsdp_consumed_axes,
+            fsdp_consumed_axes,
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+            (),
+        )
+        for arg_name, original_spec, partition_spec, consumed_axes in zip(
             (
                 "lhs_data",
                 "lhs_scale_inv",
@@ -1944,8 +1962,9 @@ class GroupedGemmPrimitive(BasePrimitive):
             ),
             original_arg_specs,
             final_arg_specs,
+            consumed_axes_by_arg,
         ):
-            _warn_if_axes_ignored(arg_name, original_spec, partition_spec)
+            _warn_if_axes_ignored(arg_name, original_spec, partition_spec, consumed_axes)
         if original_out_spec is not None:
             _warn_if_axes_ignored("output", original_out_spec, out_spec)
 
