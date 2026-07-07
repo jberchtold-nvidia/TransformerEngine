@@ -303,7 +303,9 @@ def _grouped_dequantize(grouped_scaled_tensor):
     Returns:
         List of dequantized tensors for each group
     """
-    data = grouped_scaled_tensor.data
+    # Group offsets are scalar-element offsets even though grouped quantization
+    # preserves the logical N-D carrier shape to avoid oversized 1-D dimensions.
+    data = grouped_scaled_tensor.data.reshape(-1)
     scale_inv = grouped_scaled_tensor.scale_inv
     group_sizes = (
         grouped_scaled_tensor.first_dims

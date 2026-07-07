@@ -120,6 +120,7 @@ if get_device_compute_capability(0) < 100:
 from transformer_engine.jax.flax import _MoEBlock as MoEBlock
 from transformer_engine.jax.moe import moe, record_ep_bootstrap_signature_for_moe
 from transformer_engine.jax.ep import ep_bootstrap
+from transformer_engine.jax.quantize import QuantizerFactory, QuantizerSet, ScalingMode
 from transformer_engine.jax.sharding import MeshResource, global_shard_guard
 
 
@@ -148,7 +149,7 @@ LOGICAL_AXIS_RULES = (
 DTYPE = jnp.bfloat16
 BATCH = EP_SIZE * FSDP_SIZE * 2  # 8 on 4-GPU, 16 on 8-GPU
 SEQ = 32
-HIDDEN = 64
+HIDDEN = int(os.environ.get("TE_EP_MOE_HIDDEN", "64"))
 INTER = 128
 NUM_EXPERTS = 8
 TOPK = 2
@@ -362,6 +363,7 @@ def _make_block(
     use_expert_routing_bias=False,
     score_function="softmax",
     bias_init=None,
+    quantizer_set=None,
 ):
     kwargs = dict(
         num_experts=NUM_EXPERTS,
@@ -374,11 +376,35 @@ def _make_block(
         score_function=score_function,
         dtype=DTYPE,
     )
+    if quantizer_set is not None:
+        kwargs["quantizer_set"] = quantizer_set
     # Custom bias_init lets tests inject a non-zero expert_bias without
     # poking variables['params'] post-init.
     if bias_init is not None:
         kwargs["bias_init"] = bias_init
     return MoEBlock(**kwargs)
+
+
+def _mxfp8_moe_quantizer_set():
+    token_quantizers = QuantizerFactory.create_set(
+        scaling_mode=ScalingMode.MXFP8_1D_SCALING,
+        fwd_dtype=jnp.float8_e4m3fn,
+        bwd_dtype=jnp.float8_e4m3fn,
+        is_2x2x=True,
+        n_groups=NUM_EXPERTS * FSDP_SIZE,
+    )
+    expert_quantizers = QuantizerFactory.create_set(
+        scaling_mode=ScalingMode.MXFP8_1D_SCALING,
+        fwd_dtype=jnp.float8_e4m3fn,
+        bwd_dtype=jnp.float8_e4m3fn,
+        is_2x2x=True,
+        n_groups=NUM_EXPERTS,
+    )
+    return QuantizerSet(
+        x=token_quantizers.x,
+        kernel=expert_quantizers.kernel,
+        dgrad=token_quantizers.dgrad,
+    )
 
 
 def _strong_expert_bias_init(key, shape, dtype):
@@ -598,6 +624,30 @@ class TestTeEpMoeForward:
             rtol=FWD_RTOL,
             err_msg=f"forward parity breach for config={config}",
         )
+
+
+class TestTeEpMoeMXFP8:
+    """MXFP8 grouped quantization through the full MoE custom VJP."""
+
+    def test_forward_and_backward(self, mesh):
+        if HIDDEN % 128 != 0:
+            pytest.skip("MXFP8 V2 MoE coverage requires a 128-aligned hidden dimension.")
+        block = _make_block(quantizer_set=_mxfp8_moe_quantizer_set())
+        x = _make_inputs(jax.random.PRNGKey(30))
+        variables, output, aux = _init_apply(block, mesh, x, jax.random.PRNGKey(31))
+        grads, grad_x = _grad_step(block, variables, mesh, x)
+
+        assert aux is None
+        assert output.shape == x.shape
+        assert output.dtype == x.dtype
+        for name, value in (
+            ("output", output),
+            ("grad_x", grad_x),
+            *((name, _unwrap(grads["params"][name])) for name in ("gate_kernel", "wi_0", "wi_1", "wo")),
+        ):
+            local_value = np.asarray(jax.device_get(value.addressable_data(0)))
+            assert np.all(np.isfinite(local_value)), f"{name} has NaN/Inf"
+            assert np.any(local_value != 0.0), f"{name} is identically zero"
 
 
 class TestTeEpMoeBackward:

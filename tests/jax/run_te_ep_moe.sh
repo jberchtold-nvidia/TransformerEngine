@@ -17,6 +17,13 @@ TE_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 TEST_FILE="$TE_ROOT/tests/jax/test_te_ep_moe.py"
 PYTEST_INI="$TE_ROOT/tests/jax/pytest.ini"
 
+# Prefer the NCCL-EP library built from this checkout. Editable installs can
+# retain an older copied library beside the Python extension.
+NCCL_EP_LIB_DIR="$TE_ROOT/3rdparty/nccl/build/lib"
+if [ -f "$NCCL_EP_LIB_DIR/libnccl_ep.so.0" ]; then
+    export LD_LIBRARY_PATH="$NCCL_EP_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
 NUM_GPUS="${NUM_GPUS:-$(nvidia-smi -L | wc -l)}"
 if [ "$NUM_GPUS" -lt 4 ]; then
     echo "[run_te_ep_moe.sh] need >=4 GPUs (got $NUM_GPUS); aborting" >&2

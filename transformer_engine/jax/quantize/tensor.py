@@ -11,6 +11,7 @@ rowwise and colwise quantization modes with proper scaling and dequantization.
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 from abc import ABC, abstractmethod
+import math
 
 import jax.numpy as jnp
 from jax.tree_util import register_pytree_node_class
@@ -428,7 +429,10 @@ class GroupedScaledTensor1x(ScaledTensor1x):
 
     def __post_init__(self):
         assert self.scale_inv.ndim == 1, "Only support flattened scale_inv"
-        assert self.data.ndim == 1, "Only support flattened data"
+        assert self.data.size == math.prod(self.original_shape), (
+            f"Quantized data has {self.data.size} elements, expected "
+            f"{math.prod(self.original_shape)} for original shape {self.original_shape}"
+        )
         assert self.flatten_axis > 0
 
         data_ndim = len(self.original_shape)

@@ -28,6 +28,7 @@ recipe-driven alignment follow-up) stabilises (target: the TE release
 following the 2.16 code freeze).
 """
 
+from dataclasses import field
 from typing import Any, Callable, NewType, Optional, Tuple, Union
 
 import jax.numpy as jnp
@@ -38,6 +39,7 @@ from flax import linen as nn
 from jax.sharding import PartitionSpec as P  # noqa: F401  # pylint: disable=unused-import
 
 from ..moe import moe
+from ..quantize import QuantizerSet, noop_quantizer_set
 from ..router import ScoreFunction
 from ..sharding import get_active_resource_axis
 from .module import TransformerEngineBase
@@ -117,10 +119,8 @@ class _MoEBlock(TransformerEngineBase):
         Register per-expert FFN biases (``wi_0_bias``, ``wi_1_bias``,
         ``wo_bias``).
 
-    Quantization is currently configured via the standard TE autocast
-    context (``fp8_autocast``/``with_quantizer_set``) and threaded
-    through ``moe()`` internally; this wrapper does not expose a
-    per-call ``quantizer_sets`` knob yet.
+    quantizer_set : QuantizerSet
+        Grouped quantizers for the FFN forward and backward GEMMs.
     """
 
     # Architecture
@@ -156,6 +156,7 @@ class _MoEBlock(TransformerEngineBase):
     bias_init: Initializer = nn.initializers.zeros
     expert_bias_init: Initializer = nn.initializers.zeros
     use_ffn_bias: bool = False
+    quantizer_set: QuantizerSet = field(default_factory=lambda: noop_quantizer_set)
 
     def __post_init__(self):
         if self.kernel_init is None:
@@ -259,6 +260,7 @@ class _MoEBlock(TransformerEngineBase):
             wi_1_bias,
             wo_bias,
             expert_bias,
+            quantizer_set=self.quantizer_set,
             num_experts=self.num_experts,
             num_experts_per_tok=self.num_experts_per_tok,
             activation_type=self.activation_type,

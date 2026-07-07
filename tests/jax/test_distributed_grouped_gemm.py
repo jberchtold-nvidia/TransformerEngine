@@ -3,6 +3,7 @@
 # See LICENSE for license information.
 """Partitioning tests for grouped quantize and grouped GEMM."""
 
+import math
 from types import SimpleNamespace
 
 import jax
@@ -75,6 +76,25 @@ def _mxfp8_grouped_quantizer_set(n_groups):
     )
 
 
+def test_grouped_quantize_large_abstract_shape_preserves_inferred_hidden_dim():
+    input_shape = (786432, 4096)
+    group_count = 64
+    outputs = GroupedQuantizePrimitive.abstract(
+        jax.core.ShapedArray(input_shape, jnp.bfloat16),
+        jax.core.ShapedArray((group_count,), jnp.float32),
+        jax.core.ShapedArray((group_count,), jnp.int32),
+        out_dtype=jnp.float8_e4m3fn,
+        scaling_mode=ScalingMode.MXFP8_1D_SCALING.value,
+        q_layout=QuantizeLayout.ROWWISE,
+        flatten_axis=-1,
+        scale_dtype=jnp.float8_e8m0fnu,
+    )
+
+    assert outputs[0].shape == input_shape
+    assert max(outputs[0].shape) < 2**31
+    assert math.prod(outputs[0].shape) == 3221225472
+
+
 def test_grouped_quantize_gathers_hidden_axis_for_block_scales():
     mesh = _mesh()
     with global_shard_guard(MeshResource(fsdp_resource="fsdp", ep_resource="expert")):
@@ -95,7 +115,7 @@ def test_grouped_quantize_gathers_hidden_axis_for_block_scales():
 
     assert tuple(arg_shardings[0].spec) == ("expert", None, None)
     specs = tuple(tuple(sharding.spec) for sharding in out_shardings)
-    assert _normalize_spec(specs[0]) == ("expert",)
+    assert _normalize_spec(specs[0]) == ("expert", None, None)
     assert _normalize_spec(specs[2]) == ("expert",)
     assert _normalize_spec(specs[4]) == ("expert",)
 
@@ -120,8 +140,8 @@ def test_grouped_quantize_mxfp8_colwise_specs_gather_hidden_axis():
 
     assert tuple(arg_shardings[0].spec) == ("expert", None, None)
     specs = tuple(tuple(sharding.spec) for sharding in out_shardings)
-    assert _normalize_spec(specs[0]) == ("expert",)
-    assert _normalize_spec(specs[1]) == ("expert",)
+    assert _normalize_spec(specs[0]) == ("expert", None, None)
+    assert _normalize_spec(specs[1]) == ("expert", None, None)
     assert _normalize_spec(specs[2]) == ("expert",)
     assert _normalize_spec(specs[3]) == ("expert",)
     assert _normalize_spec(specs[4]) == ("expert",)
@@ -147,7 +167,7 @@ def test_grouped_quantize_preserves_row_side_fsdp_for_kernel():
 
     assert tuple(arg_shardings[0].spec) == ("expert", "fsdp", None)
     specs = tuple(tuple(sharding.spec) for sharding in out_shardings)
-    assert _normalize_spec(specs[0]) == (("expert", "fsdp"),)
+    assert _normalize_spec(specs[0]) == ("expert", "fsdp", None)
     assert _normalize_spec(specs[2]) == (("expert", "fsdp"),)
 
 
@@ -177,7 +197,7 @@ def test_grouped_quantize_strips_unsupported_axes_and_gathers_hidden_axes():
     assert tuple(arg_shardings[2].spec) == ("expert",)
 
     out_specs = tuple(tuple(sharding.spec) for sharding in out_shardings)
-    assert _normalize_spec(out_specs[0]) == (("expert", "dp"),)
+    assert _normalize_spec(out_specs[0]) == ("expert", "dp", None)
     assert _normalize_spec(out_specs[2]) == (("expert", "dp"),)
     assert _normalize_spec(out_specs[4]) == ("expert",)
     for spec in (*out_specs, *(tuple(sharding.spec) for sharding in arg_shardings)):
@@ -377,7 +397,7 @@ def test_grouped_partitioning_strips_arbitrary_unsupported_axis():
     assert tuple(quantize_arg_shardings[0].spec) == ("expert", None, None)
     assert tuple(quantize_arg_shardings[1].spec) == ("expert",)
     quantize_out_specs = tuple(tuple(sharding.spec) for sharding in quantize_out_shardings)
-    assert _normalize_spec(quantize_out_specs[0]) == ("expert",)
+    assert _normalize_spec(quantize_out_specs[0]) == ("expert", None, None)
     assert _normalize_spec(quantize_out_specs[2]) == ("expert",)
 
     assert tuple(gemm_arg_shardings[0].spec) == ("dp",)
@@ -410,7 +430,7 @@ def test_grouped_partitioning_shardy_rules_smoke():
             SimpleNamespace(shape=(8,)),
         ),
         (
-            SimpleNamespace(shape=(8 * 128 * 64,)),
+            SimpleNamespace(shape=(8, 128, 64)),
             SimpleNamespace(shape=(1,)),
             SimpleNamespace(shape=(8 * 128 * 64,)),
             SimpleNamespace(shape=(1,)),
