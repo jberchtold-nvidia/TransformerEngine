@@ -428,7 +428,10 @@ class GroupedScaledTensor1x(ScaledTensor1x):
         return jnp.ones((self.original_shape[0],), dtype=jnp.int32)
 
     def __post_init__(self):
-        assert self.scale_inv.ndim == 1, "Only support flattened scale_inv"
+        assert self.scale_inv.ndim in (1, 3), (
+            "Grouped scale_inv must be flat or use the uniform-kernel 3D carrier, "
+            f"got shape {self.scale_inv.shape}"
+        )
         assert self.data.size == math.prod(self.original_shape), (
             f"Quantized data has {self.data.size} elements, expected "
             f"{math.prod(self.original_shape)} for original shape {self.original_shape}"
@@ -450,13 +453,23 @@ class GroupedScaledTensor1x(ScaledTensor1x):
         else:
             num_groups = self.original_shape[0]
 
-        expected_scale_shape = self.scaling_mode.get_grouped_scale_shape(
-            self.original_shape,
-            num_groups,
-            self.is_colwise,
-            is_padded=True,
-            flatten_axis=self.flatten_axis,
-        )
+        if self.scale_inv.ndim == 3:
+            assert self.scaling_mode == ScalingMode.MXFP8_1D_SCALING
+            assert len(self.original_shape) == 3 and self.flatten_axis == 2
+            groups, rows, columns = self.original_shape
+            expected_scale_shape = (
+                (groups, columns // 128, rows * 4)
+                if self.is_colwise
+                else (groups, rows // 128, columns * 4)
+            )
+        else:
+            expected_scale_shape = self.scaling_mode.get_grouped_scale_shape(
+                self.original_shape,
+                num_groups,
+                self.is_colwise,
+                is_padded=True,
+                flatten_axis=self.flatten_axis,
+            )
 
         assert self.scale_inv.shape == expected_scale_shape, (
             f"Unexpected scale_inv shape! \nExpect {expected_scale_shape} for padded"
