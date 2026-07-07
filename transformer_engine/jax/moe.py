@@ -532,19 +532,16 @@ def _moe_fwd_rule(
 
     # Per-rank send capacity: B/num_procs rows x S tokens per rank.
     max_tokens_per_rank = (B // num_procs) * S
-    # Per-rank receive capacity. NCCL EP HT lays out the per-rank receive
-    # buffer as ``[num_local_experts, num_ep * max_tokens_per_rank, hidden]``
-    # (see nccl_ep.cc::init kernel buffer sizing + the LL combine assertion
-    # at nccl_ep.cc:2185 which spells out the same layout). The natural
-    # dropless K-expanded count
-    # ``ceil((B/dp)*S*K / num_local_experts)`` does NOT match: it ignores
-    # the worst-case where all of one EP group's tokens land on a single
-    # local expert. We must size to that worst case or NCCL EP's HT kernel
-    # rejects the dispatch buffer with ``invalid argument``.
-    natural_spe = num_ep * max_tokens_per_rank  # = (B // dp_size) * S
+
+    # Bound receive capacity by the total top-k assignments in one EP group.
+    natural_recv_pr = num_ep * max_tokens_per_rank * K
+    natural_spe = (natural_recv_pr + num_local_experts - 1) // num_local_experts
+
     # NCCL EP requires each expert-major output block to be at least
     # ``_ALIGN_SIZE`` (=128) tokens; see the constant's docstring.
-    slots_per_expert = ((natural_spe + _ALIGN_SIZE - 1) // _ALIGN_SIZE) * _ALIGN_SIZE
+    slots_per_expert = (
+        (natural_spe + _ALIGN_SIZE - 1) // _ALIGN_SIZE
+    ) * _ALIGN_SIZE
     recv_pr = num_local_experts * slots_per_expert
 
     _te_ep_assert_compatible_bootstrap(
