@@ -111,6 +111,9 @@ class _MoEBlock(TransformerEngineBase):
     recv_capacity_per_rank : Optional[int]
         Exact aligned receive capacity per EP rank. ``None`` reserves the
         dropless worst case.
+    ffn1_gate_ckpt_name, ffn1_up_ckpt_name, ffn2_ckpt_name : str
+        Named-checkpoint labels for the two fused-FC1 projections and the FC2
+        expert output.
 
     The per-expert dispatch-slot alignment is fixed internally at 128
     tokens (see ``moe._ALIGN_SIZE``) -- the value required by NCCL EP
@@ -157,6 +160,9 @@ class _MoEBlock(TransformerEngineBase):
     # MoE knobs forwarded to ``moe()``
     apply_topk_weights_early: bool = False
     recv_capacity_per_rank: Optional[int] = None
+    ffn1_gate_ckpt_name: str = "moe_mlpwi_0"
+    ffn1_up_ckpt_name: str = "moe_mlpwi_1"
+    ffn2_ckpt_name: str = "moe_mlpwo"
 
     # Dtypes / init / misc
     dtype: DType = jnp.float32
@@ -309,6 +315,9 @@ class _MoEBlock(TransformerEngineBase):
             apply_topk_weights_early=self.apply_topk_weights_early,
             quantizer_sets=quantizer_sets,
             recv_capacity_per_rank=self.recv_capacity_per_rank,
+            ffn1_gate_ckpt_name=self.ffn1_gate_ckpt_name,
+            ffn1_up_ckpt_name=self.ffn1_up_ckpt_name,
+            ffn2_ckpt_name=self.ffn2_ckpt_name,
             ep_axis=ep_axis,
             data_parallelism_axes=self.data_parallelism_axes,
             input_axes=self.input_axes,

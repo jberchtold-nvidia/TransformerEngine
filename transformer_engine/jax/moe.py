@@ -38,6 +38,7 @@ from typing import Any, Optional, Tuple, Union
 import flax.struct
 import jax
 import jax.numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from . import cpp_extensions as tex
@@ -80,7 +81,9 @@ def get_moe_recv_capacity_per_rank(
     per-local-expert alignment required by NCCL EP.
     """
     if num_experts <= 0 or num_experts_per_tok <= 0 or max_tokens_per_rank <= 0:
-        raise ValueError("num_experts, num_experts_per_tok, and max_tokens_per_rank must be positive")
+        raise ValueError(
+            "num_experts, num_experts_per_tok, and max_tokens_per_rank must be positive"
+        )
     if ep_size <= 0 or num_experts % ep_size != 0:
         raise ValueError(f"num_experts={num_experts} must be divisible by ep_size={ep_size}")
     if alignment <= 0:
@@ -95,18 +98,12 @@ def get_moe_recv_capacity_per_rank(
 
     num_local_experts = num_experts // ep_size
     tokens_per_ep_group = ep_size * max_tokens_per_rank
-    max_local_assignments = tokens_per_ep_group * min(
-        num_experts_per_tok, num_local_experts
-    )
+    max_local_assignments = tokens_per_ep_group * min(num_experts_per_tok, num_local_experts)
     max_nonempty_experts = min(num_local_experts, max_local_assignments)
     padded_total_bound = max_local_assignments + (alignment - 1) * max_nonempty_experts
-    aligned_total_bound = (
-        (padded_total_bound + alignment - 1) // alignment
-    ) * alignment
+    aligned_total_bound = ((padded_total_bound + alignment - 1) // alignment) * alignment
     per_expert_bound = (
-        num_local_experts
-        * ((tokens_per_ep_group + alignment - 1) // alignment)
-        * alignment
+        num_local_experts * ((tokens_per_ep_group + alignment - 1) // alignment) * alignment
     )
     worst_case = min(per_expert_bound, aligned_total_bound)
     if recv_capacity_factor is None:
@@ -116,9 +113,7 @@ def get_moe_recv_capacity_per_rank(
         max_tokens_per_rank * num_experts_per_tok + num_local_experts - 1
     ) // num_local_experts
     balanced_aligned = (
-        num_local_experts
-        * ((balanced_per_expert + alignment - 1) // alignment)
-        * alignment
+        num_local_experts * ((balanced_per_expert + alignment - 1) // alignment) * alignment
     )
     requested = math.ceil(balanced_aligned * recv_capacity_factor)
     requested = ((requested + alignment - 1) // alignment) * alignment
@@ -355,6 +350,9 @@ def _ffn_fwd_per_shard(
     num_local_experts: int,
     activation_type: str,
     apply_topk_weights_early: bool,
+    ffn1_gate_ckpt_name: str,
+    ffn1_up_ckpt_name: str,
+    ffn2_ckpt_name: str,
 ):
     """Run the grouped FFN on one shard's EP receive buffer."""
     hidden = recv_tokens_local.shape[-1]
@@ -386,6 +384,8 @@ def _ffn_fwd_per_shard(
         bias=wi_combined_bias,
     )
     gate_proj_out, up_proj_out = jnp.split(combined_out, 2, axis=-1)
+    gate_proj_out = checkpoint_name(gate_proj_out, ffn1_gate_ckpt_name)
+    up_proj_out = checkpoint_name(up_proj_out, ffn1_up_ckpt_name)
 
     # Activation inputs (gate_proj_out, up_proj_out) stay in the wi GEMM
     # output dtype; the activation output (`intermediate`) stays in the
@@ -413,23 +413,16 @@ def _ffn_fwd_per_shard(
         contracting_dims=((1,), (1,)),
         bias=wo_bias,
     )
+    expert_outputs = checkpoint_name(expert_outputs, ffn2_ckpt_name)
     expert_outputs_3d = expert_outputs.reshape(1, expert_outputs.shape[0], expert_outputs.shape[1])
     group_sizes_2d = group_sizes.reshape(1, num_local_experts)
     residuals = (
-        casted_sorted_x.get_tensor(usage=TensorUsage.LHS_TRANS).checkpoint(
-            fc1_quantizer_set.x
-        ),
-        casted_wi.get_tensor(usage=TensorUsage.RHS_TRANS).checkpoint(
-            fc1_quantizer_set.kernel
-        ),
+        casted_sorted_x.get_tensor(usage=TensorUsage.LHS_TRANS).checkpoint(fc1_quantizer_set.x),
+        casted_wi.get_tensor(usage=TensorUsage.RHS_TRANS).checkpoint(fc1_quantizer_set.kernel),
         gate_proj_out,
         up_proj_out,
-        casted_intermediate.get_tensor(usage=TensorUsage.LHS_TRANS).checkpoint(
-            fc2_quantizer_set.x
-        ),
-        casted_wo.get_tensor(usage=TensorUsage.RHS_TRANS).checkpoint(
-            fc2_quantizer_set.kernel
-        ),
+        casted_intermediate.get_tensor(usage=TensorUsage.LHS_TRANS).checkpoint(fc2_quantizer_set.x),
+        casted_wo.get_tensor(usage=TensorUsage.RHS_TRANS).checkpoint(fc2_quantizer_set.kernel),
         group_sizes_2d,
     )
     return expert_outputs_3d, residuals
@@ -579,6 +572,9 @@ def _moe_fwd_rule(
     dtype,
     apply_topk_weights_early,
     recv_capacity_per_rank,
+    ffn1_gate_ckpt_name,
+    ffn1_up_ckpt_name,
+    ffn2_ckpt_name,
 ):
     """Forward: gate -> topk -> ep_dispatch -> FFN -> ep_combine.
 
@@ -629,7 +625,8 @@ def _moe_fwd_rule(
         recv_pr = int(recv_capacity_per_rank)
         if recv_pr <= 0 or recv_pr % _ALIGN_SIZE != 0:
             raise ValueError(
-                f"recv_capacity_per_rank must be a positive multiple of {_ALIGN_SIZE}, got {recv_pr}"
+                f"recv_capacity_per_rank must be a positive multiple of {_ALIGN_SIZE}, got"
+                f" {recv_pr}"
             )
 
     _te_ep_assert_compatible_bootstrap(
@@ -805,6 +802,9 @@ def _moe_fwd_rule(
             num_local_experts=num_local_experts,
             activation_type=activation_type,
             apply_topk_weights_early=apply_topk_weights_early,
+            ffn1_gate_ckpt_name=ffn1_gate_ckpt_name,
+            ffn1_up_ckpt_name=ffn1_up_ckpt_name,
+            ffn2_ckpt_name=ffn2_ckpt_name,
         )
 
     expert_outputs, ffn_residuals = shard_map(
@@ -903,11 +903,22 @@ def _moe_bwd_rule(
     dtype,
     apply_topk_weights_early,
     recv_capacity_per_rank,
+    ffn1_gate_ckpt_name,
+    ffn1_up_ckpt_name,
+    ffn2_ckpt_name,
     residuals,
     cotangents,
 ):
     """Backward mirror of :func:`_moe_fwd_rule`."""
-    del num_groups, group_topk, dtype, recv_capacity_per_rank  # captured / unused in bwd
+    del (
+        num_groups,
+        group_topk,
+        dtype,
+        recv_capacity_per_rank,
+        ffn1_gate_ckpt_name,
+        ffn1_up_ckpt_name,
+        ffn2_ckpt_name,
+    )  # captured / unused in bwd
     from jax.experimental.shard_map import shard_map
 
     # total_recv_tokens is a non-differentiable output; its cotangent is unused.
@@ -977,6 +988,7 @@ def _moe_bwd_rule(
         ctx.local_group_sizes,
         ctx.recv_topk_weights,
     ]
+
     def _ffn_bwd_body(*args):
         grads = _ffn_bwd_per_shard(
             *args,
@@ -1039,7 +1051,9 @@ def _moe_bwd_rule(
         in_specs=bwd_in_specs,
         out_specs=bwd_out_specs,
         check_rep=False,
-    )(*bwd_in_args)
+    )(
+        *bwd_in_args
+    )
 
     d_recv_w_total = d_recv_w_from_combine + d_recv_w_from_intermediate
 
@@ -1149,7 +1163,7 @@ def _moe_bwd_rule(
 # =============================================================================
 
 
-@partial(jax.custom_vjp, nondiff_argnums=tuple(range(9, 27)))
+@partial(jax.custom_vjp, nondiff_argnums=tuple(range(9, 30)))
 def _moe(
     x,
     gate_kernel,
@@ -1178,6 +1192,9 @@ def _moe(
     dtype,
     apply_topk_weights_early,
     recv_capacity_per_rank,
+    ffn1_gate_ckpt_name,
+    ffn1_up_ckpt_name,
+    ffn2_ckpt_name,
 ):
     primal, _ = _moe_fwd_rule(
         x,
@@ -1207,6 +1224,9 @@ def _moe(
         dtype,
         apply_topk_weights_early,
         recv_capacity_per_rank,
+        ffn1_gate_ckpt_name,
+        ffn1_up_ckpt_name,
+        ffn2_ckpt_name,
     )
     return primal
 
@@ -1246,6 +1266,9 @@ def moe(
     wo_kernel_axes: Tuple[Optional[str], ...] = ("exp", "mlp", "embed"),
     dtype: jnp.dtype = jnp.float32,
     recv_capacity_per_rank: Optional[int] = None,
+    ffn1_gate_ckpt_name: str = "moe_mlpwi_0",
+    ffn1_up_ckpt_name: str = "moe_mlpwi_1",
+    ffn2_ckpt_name: str = "moe_mlpwo",
 ) -> Tuple[jnp.ndarray, Optional[jnp.ndarray], jnp.ndarray]:
     """Run a full MoE block under a single fused custom_vjp on the TE EP path.
 
@@ -1280,6 +1303,10 @@ def moe(
         (default) reserves the dropless aligned worst case. The value must match
         the capacity used by ``ep_bootstrap``. Overflow is reported through
         ``total_recv_tokens`` when bootstrap used ``drop_on_overflow=True``.
+    ffn1_gate_ckpt_name, ffn1_up_ckpt_name, ffn2_ckpt_name : str
+        Names attached to the two fused-FC1 projections and the FC2 expert
+        output for use with named JAX checkpoint policies. The defaults match
+        MaxText's MoE rematerialization policy names.
 
     Note that the per-expert dispatch-slot alignment is fixed internally
     at 128 tokens (``_ALIGN_SIZE``); see that constant's docstring for
@@ -1371,6 +1398,9 @@ def moe(
         dtype,
         apply_topk_weights_early,
         recv_capacity_per_rank,
+        ffn1_gate_ckpt_name,
+        ffn1_up_ckpt_name,
+        ffn2_ckpt_name,
     )
     if aux_loss_coeff <= 0.0:
         aux_loss = None

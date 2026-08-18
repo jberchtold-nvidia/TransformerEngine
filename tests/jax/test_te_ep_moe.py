@@ -37,6 +37,9 @@ classes:
   and numerical parity vs the same BF16 reference in one run.
 * ``test_backward`` mirrors that for gradients. BF16 and MXFP8 share
   the full test body and differ only in the grouped-GEMM quantizer sets.
+* The scan regressions compare four stacked MoE layers with an unrolled
+  oracle, documenting the uncheckpointed handle relocation bug and validating
+  the named grouped-GEMM checkpoint policy in BF16 and MXFP8.
 * ``TestTeEpMoeAuxLoss`` covers the second return value end-to-end
   (returned + parity + aux-only grad propagates to gate + combined
   main+aux grads stay finite) in two consolidated tests.
@@ -124,6 +127,13 @@ from transformer_engine.jax.moe import (
 )
 from transformer_engine.jax.ep import ep_bootstrap
 from transformer_engine.common.recipe import MXFP8BlockScaling
+from transformer_engine.jax.quantize import (
+    QuantizeMeta,
+    QuantizeMetaSet,
+    QuantizerFactory,
+    QuantizerSet,
+    noop_quantizer_set,
+)
 from transformer_engine.jax.sharding import MeshResource, global_shard_guard
 
 
@@ -198,16 +208,10 @@ def _compute_worst_case_recv_pr():
     tokens_per_ep_group = EP_SIZE * max_tokens_per_rank
     max_local_assignments = tokens_per_ep_group * min(TOPK, num_local_experts)
     max_nonempty_experts = min(num_local_experts, max_local_assignments)
-    padded_total_bound = (
-        max_local_assignments + (_ALIGN_SIZE - 1) * max_nonempty_experts
-    )
-    aligned_total_bound = (
-        (padded_total_bound + _ALIGN_SIZE - 1) // _ALIGN_SIZE
-    ) * _ALIGN_SIZE
+    padded_total_bound = max_local_assignments + (_ALIGN_SIZE - 1) * max_nonempty_experts
+    aligned_total_bound = ((padded_total_bound + _ALIGN_SIZE - 1) // _ALIGN_SIZE) * _ALIGN_SIZE
     per_expert_bound = (
-        num_local_experts
-        * ((tokens_per_ep_group + _ALIGN_SIZE - 1) // _ALIGN_SIZE)
-        * _ALIGN_SIZE
+        num_local_experts * ((tokens_per_ep_group + _ALIGN_SIZE - 1) // _ALIGN_SIZE) * _ALIGN_SIZE
     )
     return min(per_expert_bound, aligned_total_bound)
 
@@ -232,9 +236,7 @@ def mesh():
     # Eager bootstrap: ep_bootstrap does a host-side NCCL UID allgather
     # and cannot run from inside jax.jit. Sized to the worst-case recv_pr
     # across _CONFIGS so every parametrized config is bootstrap-compatible.
-    with mesh_obj, global_shard_guard(
-        MeshResource(ep_resource=EP_AXIS, fsdp_resource=FSDP_AXIS)
-    ):
+    with mesh_obj, global_shard_guard(MeshResource(ep_resource=EP_AXIS, fsdp_resource=FSDP_AXIS)):
         ep_bootstrap(
             world_size=num_procs,
             rank=jax.process_index(),
@@ -323,9 +325,7 @@ def _pure_jax_moe_reference(
         raise ValueError(f"Unsupported score_function={score_function!r}")
 
     routing_weights_full = jnp.zeros((T, num_experts), dtype=jnp.float32)
-    routing_weights_full = routing_weights_full.at[
-        jnp.arange(T)[:, None], top_indices
-    ].set(weights)
+    routing_weights_full = routing_weights_full.at[jnp.arange(T)[:, None], top_indices].set(weights)
 
     # FFN. ``apply_topk_weights_early`` is a fusion knob that doesn't
     # change the math (wo is linear), so the reference is identical for
@@ -338,9 +338,7 @@ def _pure_jax_moe_reference(
     # storing higher precision than the consumer (wo) GEMM buys nothing.
     intermediate = jax.nn.silu(layer_w0) * layer_w1
     expert_out = jnp.einsum("tem,emh->teh", intermediate, wo)  # [T, E, H]
-    output_2d = jnp.einsum(
-        "te,teh->th", routing_weights_full.astype(x.dtype), expert_out
-    )
+    output_2d = jnp.einsum("te,teh->th", routing_weights_full.astype(x.dtype), expert_out)
     output = output_2d.reshape(B, S, H).astype(x.dtype)
 
     if aux_loss_coeff > 0.0:
@@ -355,9 +353,7 @@ def _pure_jax_moe_reference(
         else:  # sigmoid
             aux_scores = jax.nn.sigmoid(logits)
             if K > 1:
-                aux_scores = aux_scores / (
-                    aux_scores.sum(axis=-1, keepdims=True) + 1e-20
-                )
+                aux_scores = aux_scores / (aux_scores.sum(axis=-1, keepdims=True) + 1e-20)
         routing_map = (routing_weights_full > 0).astype(jnp.int32)
         tokens_per_expert = jnp.sum(routing_map, axis=0)  # [E]
         sum_probs_per_expert = jnp.sum(aux_scores, axis=0)  # [E]
@@ -537,6 +533,191 @@ def _quantization_recipe(quantization):
     return MXFP8BlockScaling()
 
 
+_MOE_GEMM_CKPT_NAMES = ("moe_mlpwi_0", "moe_mlpwi_1", "moe_mlpwo")
+
+
+def _make_scan_params(mesh, num_layers):
+    """Create distinct fused-wi MoE parameters whose leading axis is scanned."""
+    gate_key, wi_key, wo_key = jax.random.split(jax.random.PRNGKey(101), 3)
+
+    with _ctx(mesh):
+
+        @jax.jit
+        def initialize():
+            params = {
+                "gate_kernel": jax.random.normal(
+                    gate_key, (num_layers, HIDDEN, NUM_EXPERTS), dtype=DTYPE
+                )
+                / np.sqrt(HIDDEN),
+                "wi": jax.random.normal(
+                    wi_key,
+                    (num_layers, NUM_EXPERTS, HIDDEN, 2 * INTER),
+                    dtype=DTYPE,
+                )
+                / np.sqrt(HIDDEN),
+                "wo": jax.random.normal(
+                    wo_key,
+                    (num_layers, NUM_EXPERTS, INTER, HIDDEN),
+                    dtype=DTYPE,
+                )
+                / np.sqrt(INTER),
+            }
+            shardings = {
+                "gate_kernel": P(None, FSDP_AXIS, EP_AXIS),
+                "wi": P(None, EP_AXIS, FSDP_AXIS, None),
+                "wo": P(None, EP_AXIS, None, FSDP_AXIS),
+            }
+            return {
+                name: jax.lax.with_sharding_constraint(value, NamedSharding(mesh, shardings[name]))
+                for name, value in params.items()
+            }
+
+        params = initialize()
+        jax.block_until_ready(params)
+    return params
+
+
+def _make_scan_quantizer_sets(quantization):
+    """Construct functional MoE quantizers without introducing Flax variables."""
+    if quantization == "bf16":
+        return (noop_quantizer_set, noop_quantizer_set)
+
+    assert quantization == "mxfp8"
+    recipe = MXFP8BlockScaling()
+
+    def empty_meta_set():
+        return QuantizeMetaSet(QuantizeMeta(), QuantizeMeta(), QuantizeMeta())
+
+    def make_quantizer_set():
+        token_set = QuantizerFactory.create_set(
+            fp8_recipe=recipe,
+            quantize_meta_set=empty_meta_set(),
+            n_groups=FSDP_SIZE * NUM_EXPERTS,
+        )
+        expert_set = QuantizerFactory.create_set(
+            fp8_recipe=recipe,
+            quantize_meta_set=empty_meta_set(),
+            n_groups=NUM_EXPERTS,
+        )
+        return QuantizerSet(
+            x=token_set.x,
+            kernel=expert_set.kernel,
+            dgrad=token_set.dgrad,
+        )
+
+    return (make_quantizer_set(), make_quantizer_set())
+
+
+def _scan_moe_layer(params, x, quantizer_sets):
+    """One residual TE-EP layer shared by scan and unrolled controls."""
+    branch, _aux, _total_recv_tokens = moe(
+        x,
+        params["gate_kernel"],
+        params["wi"],
+        params["wo"],
+        num_experts=NUM_EXPERTS,
+        num_experts_per_tok=TOPK,
+        score_function="softmax",
+        ep_axis=EP_AXIS,
+        data_parallelism_axes=(FSDP_AXIS,),
+        input_axes=("batch", None, None),
+        gate_kernel_axes=("embed", "exp"),
+        wi_kernel_axes=("exp", "embed", "mlp"),
+        wo_kernel_axes=("exp", "mlp", "embed"),
+        quantizer_sets=quantizer_sets,
+        dtype=DTYPE,
+    )
+    return x + branch
+
+
+def _run_scan_layers(params, x, quantizer_sets, *, scan_layers, checkpoint_layers):
+    """Execute identical layer parameters with scan or Python unrolling."""
+    layer_fn = _scan_moe_layer
+    if checkpoint_layers:
+        layer_fn = jax.checkpoint(
+            layer_fn,
+            policy=jax.checkpoint_policies.save_only_these_names(*_MOE_GEMM_CKPT_NAMES),
+            prevent_cse=True,
+        )
+
+    if scan_layers:
+
+        def body(carry, layer_params):
+            return layer_fn(layer_params, carry, quantizer_sets), None
+
+        return jax.lax.scan(body, x, params)[0]
+
+    value = x
+    for layer in range(params["gate_kernel"].shape[0]):
+        layer_params = jax.tree_util.tree_map(lambda p: p[layer], params)
+        value = layer_fn(layer_params, value, quantizer_sets)
+    return value
+
+
+def _scan_value_and_grad(
+    params,
+    x,
+    quantizer_sets,
+    *,
+    scan_layers,
+    checkpoint_layers,
+):
+    def loss_fn(layer_params, inputs):
+        output = _run_scan_layers(
+            layer_params,
+            inputs,
+            quantizer_sets,
+            scan_layers=scan_layers,
+            checkpoint_layers=checkpoint_layers,
+        )
+        return jnp.mean(output.astype(jnp.float32) ** 2), output
+
+    return jax.value_and_grad(loss_fn, argnums=(0, 1), has_aux=True)(params, x)
+
+
+def _assert_scan_matches_unrolled(actual, expected, mesh, *, mode):
+    """Compare the complete differentiated result from two stacked MoE runs."""
+    (expected_loss, expected_output), (expected_grads, expected_grad_x) = expected
+    (actual_loss, actual_output), (actual_grads, actual_grad_x) = actual
+
+    np.testing.assert_allclose(
+        np.asarray(jax.device_get(actual_loss), dtype=np.float32),
+        np.asarray(jax.device_get(expected_loss), dtype=np.float32),
+        atol=TE_TO_TE_ATOL,
+        rtol=TE_TO_TE_RTOL,
+        err_msg=f"{mode} loss differs from unrolled",
+    )
+    comparisons = {
+        "output": (actual_output, expected_output),
+        "d_x": (actual_grad_x, expected_grad_x),
+        **{f"d_{name}": (actual_grads[name], expected_grads[name]) for name in actual_grads},
+    }
+    for name, (actual_value, expected_value) in comparisons.items():
+        np.testing.assert_allclose(
+            _to_global_numpy(actual_value, mesh).astype(np.float32),
+            _to_global_numpy(expected_value, mesh).astype(np.float32),
+            atol=TE_TO_TE_ATOL,
+            rtol=TE_TO_TE_RTOL,
+            err_msg=f"{mode} {name} differs from unrolled",
+        )
+
+
+def _iter_nested_jaxpr_eqns(value):
+    """Yield equations from a JAXPR and all JAXPR-valued equation parameters."""
+    value = getattr(value, "jaxpr", value)
+    if hasattr(value, "eqns"):
+        for eqn in value.eqns:
+            yield eqn
+            for param in eqn.params.values():
+                yield from _iter_nested_jaxpr_eqns(param)
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_nested_jaxpr_eqns(item)
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            yield from _iter_nested_jaxpr_eqns(item)
+
+
 # -----------------------------------------------------------------------------
 # Tests
 # -----------------------------------------------------------------------------
@@ -607,9 +788,7 @@ class TestTeEpMoeForward:
     @pytest.mark.parametrize("config", _CONFIGS)
     @pytest.mark.parametrize("quantization", _QUANTIZATION_CASES)
     def test_forward(self, mesh, config, quantization):
-        block = _make_block(
-            **config, quantization_recipe=_quantization_recipe(quantization)
-        )
+        block = _make_block(**config, quantization_recipe=_quantization_recipe(quantization))
         x = _make_inputs(jax.random.PRNGKey(0))
         variables, output, aux = _init_apply(block, mesh, x, jax.random.PRNGKey(1))
 
@@ -650,9 +829,7 @@ class TestTeEpMoeBackward:
     @pytest.mark.parametrize("config", _CONFIGS)
     @pytest.mark.parametrize("quantization", _QUANTIZATION_CASES)
     def test_backward(self, mesh, config, quantization):
-        block = _make_block(
-            **config, quantization_recipe=_quantization_recipe(quantization)
-        )
+        block = _make_block(**config, quantization_recipe=_quantization_recipe(quantization))
         x = _make_inputs(jax.random.PRNGKey(2))
         variables, _, _ = _init_apply(block, mesh, x, jax.random.PRNGKey(3))
         grads_te, grad_x_te = _grad_step(block, variables, mesh, x)
@@ -688,12 +865,8 @@ class TestTeEpMoeBackward:
         for name in ("gate_kernel", "wi", "wo"):
             # Per-tensor: finite + non-zero + parity in one pass.
             g_te = _to_global_numpy(_unwrap(grads_te["params"][name]), mesh)
-            assert np.all(
-                np.isfinite(g_te)
-            ), f"{name} grad has NaN/Inf [config={config}]"
-            assert np.any(
-                g_te != 0.0
-            ), f"{name} grad identically zero [config={config}]"
+            assert np.all(np.isfinite(g_te)), f"{name} grad has NaN/Inf [config={config}]"
+            assert np.any(g_te != 0.0), f"{name} grad identically zero [config={config}]"
             atol, rtol = (
                 (GRAD_GATE_ATOL, GRAD_GATE_RTOL)
                 if name == "gate_kernel"
@@ -705,8 +878,7 @@ class TestTeEpMoeBackward:
                 atol=atol,
                 rtol=rtol,
                 err_msg=(
-                    f"grad parity breach on {name} "
-                    f"[config={config}, quantization={quantization}]"
+                    f"grad parity breach on {name} [config={config}, quantization={quantization}]"
                 ),
             )
 
@@ -730,6 +902,99 @@ class TestTeEpMoeBackward:
             atol=GRAD_FFN_ATOL,
             rtol=GRAD_FFN_RTOL,
             err_msg=f"d_x parity breach [config={config}, quantization={quantization}]",
+        )
+
+    @pytest.mark.xfail(
+        strict=True,
+        raises=AssertionError,
+        reason=(
+            "Known TE EP pointer-keyed handle cache bug: lax.scan may relocate handle_mem "
+            "before backward and restore int32 routing with the default int64 top-k dtype"
+        ),
+    )
+    def test_scan_layers_without_checkpoint_matches_unrolled(self, mesh):
+        """Document the uncheckpointed scan failure until the core cache fix lands."""
+        params = _make_scan_params(mesh, num_layers=4)
+        quantizer_sets = _make_scan_quantizer_sets("bf16")
+        x = _make_inputs(jax.random.PRNGKey(102))
+
+        with _ctx(mesh):
+            x_sh = _shard_inputs(x, mesh)
+            unrolled_fn = jax.jit(
+                partial(
+                    _scan_value_and_grad,
+                    scan_layers=False,
+                    checkpoint_layers=False,
+                )
+            )
+            scanned_fn = jax.jit(
+                partial(
+                    _scan_value_and_grad,
+                    scan_layers=True,
+                    checkpoint_layers=False,
+                )
+            )
+            unrolled = unrolled_fn(params, x_sh, quantizer_sets)
+            jax.block_until_ready(unrolled)
+            scanned = scanned_fn(params, x_sh, quantizer_sets)
+            jax.block_until_ready(scanned)
+
+        _assert_scan_matches_unrolled(scanned, unrolled, mesh, mode="scan")
+
+    @pytest.mark.parametrize("quantization", _QUANTIZATION_CASES)
+    def test_scan_layers_checkpointed_gemms_match_unrolled(self, mesh, quantization):
+        """Saving only grouped-GEMM outputs makes scanned MoE backward correct."""
+        params = _make_scan_params(mesh, num_layers=4)
+        quantizer_sets = _make_scan_quantizer_sets(quantization)
+        x = _make_inputs(jax.random.PRNGKey(103))
+
+        with _ctx(mesh):
+            x_sh = _shard_inputs(x, mesh)
+
+            # Check the differentiated trace once. This protects the numerical
+            # test from silently retaining the whole MoE residual instead of
+            # applying the intended named-output policy inside the scan body.
+            if quantization == "bf16":
+                checkpointed_jaxpr = jax.make_jaxpr(
+                    partial(
+                        _scan_value_and_grad,
+                        scan_layers=True,
+                        checkpoint_layers=True,
+                    )
+                )(params, x_sh, quantizer_sets)
+                eqns = tuple(_iter_nested_jaxpr_eqns(checkpointed_jaxpr))
+                checkpoint_names = {
+                    eqn.params["name"]
+                    for eqn in eqns
+                    if eqn.primitive.name == "name" and "name" in eqn.params
+                }
+                assert set(_MOE_GEMM_CKPT_NAMES).issubset(checkpoint_names)
+                assert any(eqn.primitive.name in ("remat", "remat2") for eqn in eqns)
+
+            unrolled_fn = jax.jit(
+                partial(
+                    _scan_value_and_grad,
+                    scan_layers=False,
+                    checkpoint_layers=False,
+                )
+            )
+            checkpointed_scan_fn = jax.jit(
+                partial(
+                    _scan_value_and_grad,
+                    scan_layers=True,
+                    checkpoint_layers=True,
+                )
+            )
+            unrolled = unrolled_fn(params, x_sh, quantizer_sets)
+            jax.block_until_ready(unrolled)
+            checkpointed_scan = checkpointed_scan_fn(params, x_sh, quantizer_sets)
+            jax.block_until_ready(checkpointed_scan)
+
+        _assert_scan_matches_unrolled(
+            checkpointed_scan,
+            unrolled,
+            mesh,
+            mode=f"checkpointed scan ({quantization})",
         )
 
 
@@ -780,9 +1045,7 @@ class TestTeEpMoeAuxLoss:
         # wired.
         aux_grads = _grad_aux_only(block, variables, mesh, x)
         g_gate = np.asarray(
-            jax.device_get(
-                _unwrap(aux_grads["params"]["gate_kernel"]).addressable_data(0)
-            )
+            jax.device_get(_unwrap(aux_grads["params"]["gate_kernel"]).addressable_data(0))
         )
         assert np.all(np.isfinite(g_gate)), "gate grad NaN/Inf under aux-only loss"
         assert np.any(g_gate != 0.0), "aux bwd should propagate to gate_kernel"
@@ -795,8 +1058,6 @@ class TestTeEpMoeAuxLoss:
         variables, _, _ = _init_apply(block, mesh, x, jax.random.PRNGKey(23))
         grads, _ = _grad_step(block, variables, mesh, x, include_aux=True)
         for name in ("gate_kernel", "wi", "wo"):
-            g_local = np.asarray(
-                jax.device_get(_unwrap(grads["params"][name]).addressable_data(0))
-            )
+            g_local = np.asarray(jax.device_get(_unwrap(grads["params"][name]).addressable_data(0)))
             assert np.all(np.isfinite(g_local)), f"{name} grad NaN/Inf under main+aux"
             assert np.any(g_local != 0.0), f"{name} grad zero under main+aux"
