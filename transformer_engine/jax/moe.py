@@ -65,7 +65,7 @@ __all__ = ["get_moe_recv_capacity_per_rank", "moe"]
 # same 128-token tile, so a single constant covers every supported path.
 _ALIGN_SIZE = 128
 _CUDNN_JAX_ALIGN_SIZE = 256
-_CUDNN_JAX_ENV = "NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION"
+_CUDNN_JAX_ENV = "NVTE_JAX_TEMP_FLAG_FOR_ABHINAV_CUDNN_GROUPED_GEMM_FUSION"
 
 
 def _use_cudnn_cutedsl_fusion_from_env() -> bool:
@@ -1459,7 +1459,7 @@ def moe(
     at 128 tokens (``_ALIGN_SIZE``); see that constant's docstring for
     rationale and how to extend if a future recipe needs >128.
 
-    Set ``NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION=1`` to use cuDNN's
+    Set ``NVTE_JAX_TEMP_FLAG_FOR_ABHINAV_CUDNN_GROUPED_GEMM_FUSION=1`` to use cuDNN's
     dedicated JAX grouped MXFP8 GEMM + SwiGLU API for eligible SM100 calls.
     The fused path uses 256-token expert alignment. Ineligible calls warn
     and fall back to TE's regular grouped-GEMM implementation.

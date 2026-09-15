@@ -78,7 +78,7 @@ run_phase() {
     echo
     echo "============================================================"
     echo "Phase: $phase_name"
-    echo "  NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION=$fusion_env"
+    echo "  NVTE_JAX_TEMP_FLAG_FOR_ABHINAV_CUDNN_GROUPED_GEMM_FUSION=$fusion_env"
     echo "  phase pytest args : ${phase_args[*]:-<none>}"
     echo "  logs              : $phase_log_dir"
     echo "============================================================"
@@ -96,10 +96,10 @@ run_phase() {
         )
         if [ "$i" -eq 0 ]; then
             echo "=== Live output from process 0 ($phase_name) ==="
-            env NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION="$fusion_env" \
+            env NVTE_JAX_TEMP_FLAG_FOR_ABHINAV_CUDNN_GROUPED_GEMM_FUSION="$fusion_env" \
                 "${pytest_cmd[@]}" 2>&1 | tee "$log_file" &
         else
-            env NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION="$fusion_env" \
+            env NVTE_JAX_TEMP_FLAG_FOR_ABHINAV_CUDNN_GROUPED_GEMM_FUSION="$fusion_env" \
                 "${pytest_cmd[@]}" > "$log_file" 2>&1 &
         fi
         PIDS+=("$!")
@@ -136,7 +136,7 @@ run_phase() {
     fi
 }
 
-if [ "${NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION:-0}" = "1" ]; then
+if [ "${NVTE_JAX_TEMP_FLAG_FOR_ABHINAV_CUDNN_GROUPED_GEMM_FUSION:-0}" = "1" ]; then
     # Keep ordinary CUDA C++ and cuDNN JAX coverage in separate Python process
     # groups. TE EP/NCCL caches layer alignment process-wide, so 128-token and
     # 256-token dispatch-alignment tests cannot safely share one interpreter.

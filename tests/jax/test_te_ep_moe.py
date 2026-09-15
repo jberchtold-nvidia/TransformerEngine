@@ -704,7 +704,10 @@ class TestTeEpMoeCudnnCutedslFusion:
     @pytest.mark.parametrize("apply_topk_weights_early", [False, True])
     def test_mxfp8_forward_and_backward(self, mesh, apply_topk_weights_early):
         if not _use_cudnn_cutedsl_fusion_from_env():
-            pytest.skip("run separately with NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION=1")
+            pytest.skip(
+                "run separately with "
+                "NVTE_JAX_TEMP_FLAG_FOR_ABHINAV_CUDNN_GROUPED_GEMM_FUSION=1"
+            )
         block = _make_block(
             apply_topk_weights_early=apply_topk_weights_early,
             quantization_recipe=MXFP8BlockScaling(),
