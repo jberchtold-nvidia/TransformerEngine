@@ -102,7 +102,9 @@ def _cudnn_jax_fusion_rejection_reasons(
     if wi_0_bias is not None or wi_1_bias is not None:
         errors.append("does not support FC1 gate/up bias")
     if wi.ndim != 3 or wi.shape[-1] % 64:
-        errors.append(f"requires rank-3 wi with a 64-aligned gated dimension, got {wi.shape}")
+        errors.append(
+            f"requires rank-3 wi with a 64-aligned gated dimension, got {wi.shape}"
+        )
     if x.dtype not in (jnp.bfloat16, jnp.float16):
         errors.append(f"requires BF16 or FP16 activations, got {x.dtype}")
 
@@ -125,21 +127,31 @@ def _cudnn_jax_fusion_rejection_reasons(
 
     if all(isinstance(q, GroupedQuantizer) for q in required_quantizers.values()):
         if fc1_quantizer_set.x.q_dtype != fc1_quantizer_set.kernel.q_dtype:
-            errors.append("requires identical FC1 activation and weight MXFP8 payload dtypes")
+            errors.append(
+                "requires identical FC1 activation and weight MXFP8 payload dtypes"
+            )
         supported = (jnp.float8_e4m3fn, jnp.float8_e5m2)
         for name, quantizer in required_quantizers.items():
             if quantizer.q_dtype not in supported:
-                errors.append(f"unsupported MXFP8 payload dtype {quantizer.q_dtype} for {name}")
+                errors.append(
+                    f"unsupported MXFP8 payload dtype {quantizer.q_dtype} for {name}"
+                )
 
     mesh = _get_mesh()
     if mesh is not None and not mesh.empty and ep_axis in mesh.shape:
         num_local_experts = num_experts // mesh.shape[ep_axis]
         if num_local_experts > 1024:
-            errors.append(f"requires at most 1024 local experts, got {num_local_experts}")
+            errors.append(
+                f"requires at most 1024 local experts, got {num_local_experts}"
+            )
 
-    dependencies_available, dependency_error = tex.grouped_gemm_swiglu_dependencies_available()
+    dependencies_available, dependency_error = (
+        tex.grouped_gemm_swiglu_dependencies_available()
+    )
     if not dependencies_available:
-        errors.append(f"could not load cuDNN's grouped SwiGLU JAX API: {dependency_error}")
+        errors.append(
+            f"could not load cuDNN's grouped SwiGLU JAX API: {dependency_error}"
+        )
     return errors
 
 
@@ -164,14 +176,18 @@ def get_moe_recv_capacity_per_rank(
     """
     if alignment is None:
         alignment = (
-            _CUDNN_JAX_ALIGN_SIZE if _use_cudnn_cutedsl_fusion_from_env() else _ALIGN_SIZE
+            _CUDNN_JAX_ALIGN_SIZE
+            if _use_cudnn_cutedsl_fusion_from_env()
+            else _ALIGN_SIZE
         )
     if num_experts <= 0 or num_experts_per_tok <= 0 or max_tokens_per_rank <= 0:
         raise ValueError(
             "num_experts, num_experts_per_tok, and max_tokens_per_rank must be positive"
         )
     if ep_size <= 0 or num_experts % ep_size != 0:
-        raise ValueError(f"num_experts={num_experts} must be divisible by ep_size={ep_size}")
+        raise ValueError(
+            f"num_experts={num_experts} must be divisible by ep_size={ep_size}"
+        )
     if alignment <= 0:
         raise ValueError(f"alignment must be positive, got {alignment}")
     if recv_capacity_factor is not None:
@@ -184,12 +200,18 @@ def get_moe_recv_capacity_per_rank(
 
     num_local_experts = num_experts // ep_size
     tokens_per_ep_group = ep_size * max_tokens_per_rank
-    max_local_assignments = tokens_per_ep_group * min(num_experts_per_tok, num_local_experts)
+    max_local_assignments = tokens_per_ep_group * min(
+        num_experts_per_tok, num_local_experts
+    )
     max_nonempty_experts = min(num_local_experts, max_local_assignments)
     padded_total_bound = max_local_assignments + (alignment - 1) * max_nonempty_experts
-    aligned_total_bound = ((padded_total_bound + alignment - 1) // alignment) * alignment
+    aligned_total_bound = (
+        (padded_total_bound + alignment - 1) // alignment
+    ) * alignment
     per_expert_bound = (
-        num_local_experts * ((tokens_per_ep_group + alignment - 1) // alignment) * alignment
+        num_local_experts
+        * ((tokens_per_ep_group + alignment - 1) // alignment)
+        * alignment
     )
     worst_case = min(per_expert_bound, aligned_total_bound)
     if recv_capacity_factor is None:
@@ -199,7 +221,9 @@ def get_moe_recv_capacity_per_rank(
         max_tokens_per_rank * num_experts_per_tok + num_local_experts - 1
     ) // num_local_experts
     balanced_aligned = (
-        num_local_experts * ((balanced_per_expert + alignment - 1) // alignment) * alignment
+        num_local_experts
+        * ((balanced_per_expert + alignment - 1) // alignment)
+        * alignment
     )
     requested = math.ceil(balanced_aligned * recv_capacity_factor)
     requested = ((requested + alignment - 1) // alignment) * alignment
@@ -234,10 +258,14 @@ def _with_sharding_constraint_cast_bwd(x: jnp.ndarray, sharding) -> jnp.ndarray:
         return jax.lax.with_sharding_constraint(y, sharding)
 
     def _constraint_fwd(y):
-        return jax.lax.with_sharding_constraint(y, sharding), jnp.zeros((), dtype=y.dtype)
+        return jax.lax.with_sharding_constraint(y, sharding), jnp.zeros(
+            (), dtype=y.dtype
+        )
 
     def _constraint_bwd(dtype_ref, grad):
-        return (jax.lax.with_sharding_constraint(grad.astype(dtype_ref.dtype), sharding),)
+        return (
+            jax.lax.with_sharding_constraint(grad.astype(dtype_ref.dtype), sharding),
+        )
 
     _constraint.defvjp(_constraint_fwd, _constraint_bwd)
     return _constraint(x)
@@ -295,7 +323,9 @@ def _te_ep_assert_compatible_bootstrap(
             " transformer_engine.jax.moe.record_ep_bootstrap_signature_for_moe(...)"
             " with the same params, before invoking moe()."
         )
-    b_num_experts, b_max_tpr, b_recv_pr, b_hidden, b_ep_size = _te_ep_bootstrap_signature
+    b_num_experts, b_max_tpr, b_recv_pr, b_hidden, b_ep_size = (
+        _te_ep_bootstrap_signature
+    )
     if (
         num_experts != b_num_experts
         or hidden_dim != b_hidden
@@ -374,7 +404,9 @@ def _validate_moe_quantizer_sets(
     supports only no-op quantizers and stateless MXFP8 grouped quantizers.
     """
     if not isinstance(quantizer_sets, tuple) or len(quantizer_sets) != 2:
-        raise TypeError("MoE quantizer_sets must be a tuple of FC1 and FC2 QuantizerSet objects.")
+        raise TypeError(
+            "MoE quantizer_sets must be a tuple of FC1 and FC2 QuantizerSet objects."
+        )
 
     expected_groups = {
         "x": num_token_groups,
@@ -455,7 +487,9 @@ def _ffn_fwd_per_shard(
     else:
         wi_for_gemm = wi
     wi_combined_bias = (
-        jnp.concatenate([wi_0_bias, wi_1_bias], axis=-1) if wi_0_bias is not None else None
+        jnp.concatenate([wi_0_bias, wi_1_bias], axis=-1)
+        if wi_0_bias is not None
+        else None
     )
 
     fc1_quantizer_set, fc2_quantizer_set = quantizer_sets
@@ -465,7 +499,9 @@ def _ffn_fwd_per_shard(
         group_sizes,
         flatten_axis=-1,
     )
-    casted_wi = tex.grouped_quantize(wi_for_gemm, fc1_quantizer_set.kernel, flatten_axis=-1)
+    casted_wi = tex.grouped_quantize(
+        wi_for_gemm, fc1_quantizer_set.kernel, flatten_axis=-1
+    )
     casted_intermediate = None
     if use_cudnn_jax_fusion:
         casted_sorted_x_lhs = casted_sorted_x.get_tensor(usage=TensorUsage.LHS)
@@ -484,9 +520,9 @@ def _ffn_fwd_per_shard(
             intermediate_scale_col,
         ) = tex.grouped_gemm_swiglu(
             casted_sorted_x_lhs.data.reshape(sorted_x.shape[0], hidden, 1),
-            casted_wi_rhs.data.reshape(num_local_experts, hidden, wi_for_gemm.shape[-1]).transpose(
-                0, 2, 1
-            ),
+            casted_wi_rhs.data.reshape(
+                num_local_experts, hidden, wi_for_gemm.shape[-1]
+            ).transpose(0, 2, 1),
             casted_sorted_x_lhs.scale_inv,
             casted_wi_rhs.scale_inv,
             padded_offsets,
@@ -573,15 +609,25 @@ def _ffn_fwd_per_shard(
         contracting_dims=((1,), (1,)),
         bias=wo_bias,
     )
-    expert_outputs_3d = expert_outputs.reshape(1, expert_outputs.shape[0], expert_outputs.shape[1])
+    expert_outputs_3d = expert_outputs.reshape(
+        1, expert_outputs.shape[0], expert_outputs.shape[1]
+    )
     group_sizes_2d = group_sizes.reshape(1, num_local_experts)
     residuals = (
-        casted_sorted_x.get_tensor(usage=TensorUsage.LHS_TRANS).checkpoint(fc1_quantizer_set.x),
-        casted_wi.get_tensor(usage=TensorUsage.RHS_TRANS).checkpoint(fc1_quantizer_set.kernel),
-        gate_proj_out,
+        casted_sorted_x.get_tensor(usage=TensorUsage.LHS_TRANS).checkpoint(
+            fc1_quantizer_set.x
+        ),
+        casted_wi.get_tensor(usage=TensorUsage.RHS_TRANS).checkpoint(
+            fc1_quantizer_set.kernel
+        ),
+        combined_out if use_cudnn_jax_fusion else gate_proj_out,
         up_proj_out,
-        casted_intermediate.get_tensor(usage=TensorUsage.LHS_TRANS).checkpoint(fc2_quantizer_set.x),
-        casted_wo.get_tensor(usage=TensorUsage.RHS_TRANS).checkpoint(fc2_quantizer_set.kernel),
+        casted_intermediate.get_tensor(usage=TensorUsage.LHS_TRANS).checkpoint(
+            fc2_quantizer_set.x
+        ),
+        casted_wo.get_tensor(usage=TensorUsage.RHS_TRANS).checkpoint(
+            fc2_quantizer_set.kernel
+        ),
         group_sizes_2d,
     )
     return expert_outputs_3d, residuals
@@ -619,11 +665,6 @@ def _ffn_bwd_per_shard(
     )
     _casted_d_eo_lhs = casted_d_eo.get_tensor(usage=TensorUsage.LHS)
     _casted_d_eo_rhs = casted_d_eo.get_tensor(usage=TensorUsage.RHS)
-    d_intermediate = tex.grouped_gemm(
-        _casted_d_eo_lhs,
-        casted_wo_rhs_trans,
-        contracting_dims=((1,), (2,)),
-    )
     d_wo = tex.grouped_gemm(
         casted_intermediate_lhs_trans,
         _casted_d_eo_rhs,
@@ -631,51 +672,111 @@ def _ffn_bwd_per_shard(
     )
     d_wo_bias = tex.grouped_dbias(d_eo_2d, group_sizes) if has_bias else None
 
-    act_fn = _convert_to_activation_function(activation_type)
-    if apply_topk_weights_early:
-        # intermediate' = intermediate * w.
-        # Masking is not required as:
-        # 1. Padding between groups is zero padded due to NCCL EP.
-        # 2. Overallocated padding past all groups is uninitialized, but subsequent GEMMs and EP are all group-size aware and will not read past the final group.
-        w_b = recv_w_flat[:, None].astype(d_intermediate.dtype)
-        gate_proj_for_bwd = gate_proj_out
-        up_proj_for_bwd = up_proj_out
-        intermediate_unweighted = act_fn(gate_proj_out) * up_proj_out
-        d_recv_w_from_intermediate = jnp.sum(
-            d_intermediate * intermediate_unweighted,
-            axis=-1,
-        ).astype(recv_w_flat.dtype)
-        d_intermediate = d_intermediate * w_b
+    if use_cudnn_jax_fusion:
+        # The forward residual uses this slot for cuDNN's interleaved pre-activation C.
+        combined_out = gate_proj_out
+        rows, combined = combined_out.shape
+        intermediate = combined // 2
+        hidden = d_eo_2d.shape[-1]
+        num_local_experts = group_sizes.size
+        padded_offsets = jnp.cumsum(group_sizes, dtype=jnp.int32)
+        prob = (
+            recv_w_flat
+            if apply_topk_weights_early
+            else jnp.ones((rows,), dtype=jnp.float32)
+        )
+        (
+            d_combined_row,
+            d_combined_col,
+            dprob,
+            d_combined_scale_row,
+            d_combined_scale_col,
+        ) = tex.grouped_gemm_dswiglu(
+            _casted_d_eo_lhs.data.reshape(rows, hidden),
+            casted_wo_rhs_trans.data.reshape(num_local_experts, intermediate, hidden),
+            combined_out,
+            _casted_d_eo_lhs.scale_inv,
+            casted_wo_rhs_trans.scale_inv,
+            padded_offsets,
+            prob,
+            output_dtype=fc1_quantizer_set.dgrad.q_dtype,
+        )
+        d_recv_w_from_intermediate = (
+            dprob.astype(recv_w_flat.dtype)
+            if apply_topk_weights_early
+            else jnp.zeros_like(recv_w_flat)
+        )
+
+        combined_shape = (rows, combined)
+        scaling_mode = fc1_quantizer_set.dgrad.scaling_mode
+        row_scale_size = scaling_mode.get_grouped_scale_shape(
+            combined_shape,
+            num_local_experts,
+            False,
+            is_padded=True,
+            flatten_axis=1,
+        )[0]
+        col_scale_size = scaling_mode.get_grouped_scale_shape(
+            combined_shape,
+            num_local_experts,
+            True,
+            is_padded=True,
+            flatten_axis=1,
+        )[0]
+        d_combined_scale_row = jnp.pad(
+            d_combined_scale_row,
+            (0, row_scale_size - d_combined_scale_row.size),
+        )
+        d_combined_scale_col = jnp.pad(
+            d_combined_scale_col,
+            (0, col_scale_size - d_combined_scale_col.size),
+        )
+        casted_d_combined = ScaledTensorFactory.create(
+            data=d_combined_row.reshape(-1),
+            scale_inv=d_combined_scale_row,
+            colwise_data=d_combined_col.reshape(-1),
+            colwise_scale_inv=d_combined_scale_col,
+            scaling_mode=scaling_mode,
+            dq_dtype=d_eo_2d.dtype,
+            data_layout=fc1_quantizer_set.dgrad.data_layout,
+            q_layout=fc1_quantizer_set.dgrad.q_layout,
+            flatten_axis=1,
+            first_dims=group_sizes,
+            original_shape=combined_shape,
+            pre_swizzled=True,
+        )
+        d_combined_for_bias = None
     else:
-        gate_proj_for_bwd = gate_proj_out
-        up_proj_for_bwd = up_proj_out
-        d_recv_w_from_intermediate = jnp.zeros_like(recv_w_flat)
+        d_intermediate = tex.grouped_gemm(
+            _casted_d_eo_lhs,
+            casted_wo_rhs_trans,
+            contracting_dims=((1,), (2,)),
+        )
+        act_fn = _convert_to_activation_function(activation_type)
+        if apply_topk_weights_early:
+            # intermediate' = intermediate * w.
+            # Masking is not required as grouped GEMMs consume only group-size rows.
+            w_b = recv_w_flat[:, None].astype(d_intermediate.dtype)
+            intermediate_unweighted = act_fn(gate_proj_out) * up_proj_out
+            d_recv_w_from_intermediate = jnp.sum(
+                d_intermediate * intermediate_unweighted,
+                axis=-1,
+            ).astype(recv_w_flat.dtype)
+            d_intermediate = d_intermediate * w_b
+        else:
+            d_recv_w_from_intermediate = jnp.zeros_like(recv_w_flat)
 
-    # Activation bwd, symmetric with the fwd: silu' and the two
-    # elementwise products run in the GEMM dtype (no fp32 island), so
-    # the chain rule composes through at the same precision the wi/wo
-    # GEMMs consume.
-    act_gp, dact_pullback = jax.vjp(act_fn, gate_proj_for_bwd)
-    d_up_proj_out = d_intermediate * act_gp
-    (d_gate_proj_out,) = dact_pullback(d_intermediate * up_proj_for_bwd)
-
-    # wi bwd (fused gate/up via concat). Mirror the fused fwd: pack the
-    # gate/up cotangents along the trailing axis, run a single
-    # grouped_quantize + two grouped_gemm pair (one dgrad, one wgrad)
-    # against the fused casted_wi_rhs_trans residual, then split the
-    # wgrad result remains in the contiguous gated-SwiGLU ``wi`` layout.
-    d_combined_for_bias = jnp.concatenate([d_gate_proj_out, d_up_proj_out], axis=-1)
-    d_combined = (
-        tex.pack_swiglu_pair(d_gate_proj_out, d_up_proj_out)
-        if use_cudnn_jax_fusion
-        else d_combined_for_bias
-    )
-    casted_d_combined = tex.grouped_quantize(
-        d_combined,
-        fc1_quantizer_set.dgrad,
-        group_sizes,
-        flatten_axis=-1,
-    )
+        # Activation bwd stays in the GEMM dtype, matching the forward path.
+        act_gp, dact_pullback = jax.vjp(act_fn, gate_proj_out)
+        d_up_proj_out = d_intermediate * act_gp
+        (d_gate_proj_out,) = dact_pullback(d_intermediate * up_proj_out)
+        d_combined_for_bias = jnp.concatenate([d_gate_proj_out, d_up_proj_out], axis=-1)
+        casted_d_combined = tex.grouped_quantize(
+            d_combined_for_bias,
+            fc1_quantizer_set.dgrad,
+            group_sizes,
+            flatten_axis=-1,
+        )
     d_sorted_x = tex.grouped_gemm(
         casted_d_combined.get_tensor(usage=TensorUsage.LHS),
         casted_wi_rhs_trans,
@@ -761,7 +862,9 @@ def _moe_fwd_rule(
         raise ValueError("moe(...) requires ep_axis to be set (TE EP backend).")
     num_ep = mesh.shape[ep_axis]
     if num_experts % num_ep != 0:
-        raise ValueError(f"num_experts={num_experts} must be divisible by EP size={num_ep}")
+        raise ValueError(
+            f"num_experts={num_experts} must be divisible by EP size={num_ep}"
+        )
     num_local_experts = num_experts // num_ep
 
     dp_size = 1
@@ -835,7 +938,9 @@ def _moe_fwd_rule(
     # ---------------- Routing (global view) ----------------
     # expert_bias is an empty (shape-(0,)) sentinel when the caller did
     # not enable it; the primitive treats that as "no bias".
-    eb_arg = expert_bias if expert_bias.shape != (0,) else jnp.zeros((0,), dtype=jnp.float32)
+    eb_arg = (
+        expert_bias if expert_bias.shape != (0,) else jnp.zeros((0,), dtype=jnp.float32)
+    )
     sparse_probs, routing_map, saved_scores = tex.fused_topk_with_score_function_fwd(
         logits_2d,
         topk=K,
@@ -857,7 +962,9 @@ def _moe_fwd_rule(
     # single all-gather over (*dp, ep) and lives off the dispatch
     # critical path.
     if aux_loss_coeff > 0.0:
-        global_logits_2d = jax.lax.with_sharding_constraint(logits_2d, NamedSharding(mesh, P()))
+        global_logits_2d = jax.lax.with_sharding_constraint(
+            logits_2d, NamedSharding(mesh, P())
+        )
         _, global_routing_map, _ = tex.fused_topk_with_score_function_fwd(
             global_logits_2d,
             topk=K,
@@ -908,8 +1015,12 @@ def _moe_fwd_rule(
     # each rank see B/ep rows (not B/num_procs) and overrun the bootstrap-sized
     # send buffer. Pin both routing tensors to the (outer, ep) leading sharding
     # so per-rank token counts match max_tokens_per_rank.
-    topk_idx_3d = jax.lax.with_sharding_constraint(topk_idx_3d, NamedSharding(mesh, ep3_spec))
-    topk_w_3d = jax.lax.with_sharding_constraint(topk_w_3d, NamedSharding(mesh, ep3_spec))
+    topk_idx_3d = jax.lax.with_sharding_constraint(
+        topk_idx_3d, NamedSharding(mesh, ep3_spec)
+    )
+    topk_w_3d = jax.lax.with_sharding_constraint(
+        topk_w_3d, NamedSharding(mesh, ep3_spec)
+    )
 
     # ---------------- TE EP dispatch (global view) ----------------
     cfg = tex.EpLayerConfig(
@@ -917,11 +1028,15 @@ def _moe_fwd_rule(
         dispatch_output_per_expert_alignment=dispatch_alignment,
     )
     token_counts, total_recv_tokens, handle_mem = tex.ep_prepare(cfg, topk_idx_3d)
-    token_counts = jax.lax.with_sharding_constraint(token_counts, NamedSharding(mesh, ep2_spec))
+    token_counts = jax.lax.with_sharding_constraint(
+        token_counts, NamedSharding(mesh, ep2_spec)
+    )
     recv_tokens, recv_topk_weights = tex.ep_dispatch_fwd(
         cfg, handle_mem, topk_idx_3d, x, topk_w_3d, recv_pr
     )
-    recv_tokens = jax.lax.with_sharding_constraint(recv_tokens, NamedSharding(mesh, ep3_spec))
+    recv_tokens = jax.lax.with_sharding_constraint(
+        recv_tokens, NamedSharding(mesh, ep3_spec)
+    )
     recv_topk_weights = jax.lax.with_sharding_constraint(
         recv_topk_weights, NamedSharding(mesh, ep2_spec)
     )
@@ -983,7 +1098,9 @@ def _moe_fwd_rule(
         out_specs=(ep3_spec, residuals_spec),
         check_rep=False,
     )(*ffn_in_args)
-    expert_outputs = jax.lax.with_sharding_constraint(expert_outputs, NamedSharding(mesh, ep3_spec))
+    expert_outputs = jax.lax.with_sharding_constraint(
+        expert_outputs, NamedSharding(mesh, ep3_spec)
+    )
 
     # ---------------- TE EP combine (global view) ----------------
     out_partition_spec = (batch_pspec_axis, None, None)
@@ -1077,7 +1194,12 @@ def _moe_bwd_rule(
     cotangents,
 ):
     """Backward mirror of :func:`_moe_fwd_rule`."""
-    del num_groups, group_topk, dtype, recv_capacity_per_rank  # captured / unused in bwd
+    del (
+        num_groups,
+        group_topk,
+        dtype,
+        recv_capacity_per_rank,
+    )  # captured / unused in bwd
     from jax.experimental.shard_map import shard_map
 
     # total_recv_tokens is a non-differentiable output; its cotangent is unused.
@@ -1116,7 +1238,9 @@ def _moe_bwd_rule(
         w = ctx.recv_topk_weights[..., None].astype(grad_pre_combine.dtype)
         d_expert_outputs = grad_pre_combine * w
         d_recv_w_from_combine = (grad_pre_combine * ctx.expert_outputs).sum(axis=-1)
-        d_recv_w_from_combine = d_recv_w_from_combine.astype(ctx.recv_topk_weights.dtype)
+        d_recv_w_from_combine = d_recv_w_from_combine.astype(
+            ctx.recv_topk_weights.dtype
+        )
 
     # ---------------- FFN bwd (per-shard via shard_map) ----------------
     kernel_spec = P(ep_axis, None, None)
@@ -1216,8 +1340,12 @@ def _moe_bwd_rule(
     d_recv_w_total = d_recv_w_from_combine + d_recv_w_from_intermediate
 
     # ---------------- Dispatch bwd (global view) ----------------
-    d_sorted_x = jax.lax.with_sharding_constraint(d_sorted_x, NamedSharding(mesh, ep3_spec))
-    d_recv_w_total = jax.lax.with_sharding_constraint(d_recv_w_total, NamedSharding(mesh, ep2_spec))
+    d_sorted_x = jax.lax.with_sharding_constraint(
+        d_sorted_x, NamedSharding(mesh, ep3_spec)
+    )
+    d_recv_w_total = jax.lax.with_sharding_constraint(
+        d_recv_w_total, NamedSharding(mesh, ep2_spec)
+    )
     d_x_from_dispatch, d_topk_w = tex.ep_dispatch_bwd(
         ctx.cfg,
         ctx.handle_mem,
@@ -1264,7 +1392,9 @@ def _moe_bwd_rule(
         )
         # routing_map is ignored by the kernel when compute_aux_scores=True,
         # so pass a zero placeholder of the right shape/dtype.
-        zero_routing_map = jnp.zeros(ctx.aux_saved_scores.shape, dtype=ctx.routing_map.dtype)
+        zero_routing_map = jnp.zeros(
+            ctx.aux_saved_scores.shape, dtype=ctx.routing_map.dtype
+        )
         d_logits_aux = tex.fused_topk_with_score_function_bwd(
             zero_routing_map,
             ctx.aux_saved_scores,
@@ -1281,20 +1411,28 @@ def _moe_bwd_rule(
     d_gate_logits = d_logits_2d.reshape(B, S, num_experts)
     gate_kernel_cast = ctx.gate_kernel.astype(ctx.x.dtype)
     d_x_from_gate = jnp.einsum("bse,he->bsh", d_gate_logits, gate_kernel_cast)
-    d_gate_kernel = jnp.einsum("bsh,bse->he", ctx.x, d_gate_logits).astype(ctx.gate_kernel.dtype)
+    d_gate_kernel = jnp.einsum("bsh,bse->he", ctx.x, d_gate_logits).astype(
+        ctx.gate_kernel.dtype
+    )
     d_x = d_x_from_gate + d_x_from_dispatch
 
     # Pin output grads to the declared logical axes so downstream
     # optimizers see consistent shardings.
     d_x = with_sharding_constraint_by_logical_axes(d_x, input_axes)
-    d_gate_kernel = with_sharding_constraint_by_logical_axes(d_gate_kernel, gate_kernel_axes)
+    d_gate_kernel = with_sharding_constraint_by_logical_axes(
+        d_gate_kernel, gate_kernel_axes
+    )
     d_wi = with_sharding_constraint_by_logical_axes(d_wi, wi_kernel_axes)
     d_wo = with_sharding_constraint_by_logical_axes(d_wo, wo_kernel_axes)
     if has_bias:
         wi_bias_axes = (wi_kernel_axes[0], *wi_kernel_axes[2:])
         wo_bias_axes = (wo_kernel_axes[0], *wo_kernel_axes[2:])
-        d_wi_0_bias = with_sharding_constraint_by_logical_axes(d_wi_0_bias, wi_bias_axes)
-        d_wi_1_bias = with_sharding_constraint_by_logical_axes(d_wi_1_bias, wi_bias_axes)
+        d_wi_0_bias = with_sharding_constraint_by_logical_axes(
+            d_wi_0_bias, wi_bias_axes
+        )
+        d_wi_1_bias = with_sharding_constraint_by_logical_axes(
+            d_wi_1_bias, wi_bias_axes
+        )
         d_wo_bias = with_sharding_constraint_by_logical_axes(d_wo_bias, wo_bias_axes)
 
     # expert_bias has no learnable bwd path through fused_topk: the
@@ -1501,7 +1639,9 @@ def moe(
     mesh = _get_mesh()
     if mesh is None or mesh.empty:
         raise ValueError("moe(...) requires an active jax.sharding.Mesh.")
-    expected_leading: Any = (*data_parallelism_axes, ep_axis) if data_parallelism_axes else ep_axis
+    expected_leading: Any = (
+        (*data_parallelism_axes, ep_axis) if data_parallelism_axes else ep_axis
+    )
     expected_spec = P(expected_leading, None, None)
     actual_spec = getattr(getattr(x, "sharding", None), "spec", None)
     if actual_spec is not None and tuple(actual_spec) != tuple(expected_spec):
@@ -1576,5 +1716,7 @@ def moe(
     )
     if aux_loss_coeff <= 0.0:
         aux_loss = None
-    assert output.dtype == x.dtype, f"moe() output dtype {output.dtype} != input dtype {x.dtype}"
+    assert (
+        output.dtype == x.dtype
+    ), f"moe() output dtype {output.dtype} != input dtype {x.dtype}"
     return output, aux_loss, total_recv_tokens

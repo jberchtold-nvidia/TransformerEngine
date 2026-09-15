@@ -731,6 +731,44 @@ class TestTeEpMoeCudnnCutedslFusion:
         assert np.all(np.isfinite(grad_x_np))
         assert np.any(grad_x_np != 0)
 
+        params_np = _params_global_numpy(variables, mesh)
+        x_np = np.asarray(jax.device_get(x))
+
+        def loss_fn(params, inputs):
+            out, _ = _pure_jax_moe_reference(
+                inputs,
+                params["gate_kernel"],
+                params["wi"],
+                params["wo"],
+                num_experts=NUM_EXPERTS,
+                num_experts_per_tok=TOPK,
+                score_function="softmax",
+                expert_bias=None,
+            )
+            return jnp.mean(out.astype(jnp.float32) ** 2)
+
+        grads_ref, grad_x_ref = jax.jit(jax.grad(loss_fn, argnums=(0, 1)))(
+            {k: jnp.asarray(v) for k, v in params_np.items() if k != "expert_bias"},
+            jnp.asarray(x_np),
+        )
+        for name in ("gate_kernel", "wi", "wo"):
+            np.testing.assert_allclose(
+                _to_global_numpy(_unwrap(grads["params"][name]), mesh).astype(np.float32),
+                np.asarray(jax.device_get(grads_ref[name])).astype(np.float32),
+                **(
+                    GRAD_GATE_TOLERANCE["mxfp8"]
+                    if name == "gate_kernel"
+                    else GRAD_FFN_TOLERANCE["mxfp8"]
+                ),
+                err_msg=f"{name} fused MXFP8 gradient parity breach",
+            )
+        np.testing.assert_allclose(
+            grad_x_np,
+            np.asarray(jax.device_get(grad_x_ref)).astype(np.float32),
+            **GRAD_FFN_TOLERANCE["mxfp8"],
+            err_msg="d_x fused MXFP8 gradient parity breach",
+        )
+
 
 class TestTeEpMoeAuxLoss:
     """Aux-loss path. Consolidated into:

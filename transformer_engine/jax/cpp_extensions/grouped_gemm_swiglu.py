@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 
 __all__ = [
+    "grouped_gemm_dswiglu",
     "grouped_gemm_swiglu",
     "grouped_gemm_swiglu_dependencies_available",
     "pack_swiglu_pair",
@@ -21,7 +22,9 @@ def pack_swiglu_pair(gate: jax.Array, up: jax.Array) -> jax.Array:
     if gate.shape != up.shape:
         raise ValueError(f"gate shape {gate.shape} must match up shape {up.shape}")
     if gate.shape[-1] % 32:
-        raise ValueError(f"SwiGLU intermediate dimension {gate.shape[-1]} must be divisible by 32")
+        raise ValueError(
+            f"SwiGLU intermediate dimension {gate.shape[-1]} must be divisible by 32"
+        )
     blocks = gate.shape[-1] // 32
     return jnp.stack(
         (
@@ -70,7 +73,10 @@ def grouped_gemm_swiglu_dependencies_available() -> tuple[bool, str]:
     """Check the public cuDNN JAX API without compiling a kernel."""
     try:
         import cutlass.jax
-        from cudnn import grouped_gemm_swiglu_jax_sm100  # noqa: F401
+        from cudnn import (  # noqa: F401
+            grouped_gemm_dswiglu_jax_sm100,
+            grouped_gemm_swiglu_jax_sm100,
+        )
 
         if not cutlass.jax.is_available():
             return False, "CuTeDSL JAX support is unavailable"
@@ -110,23 +116,76 @@ def grouped_gemm_swiglu(
     alpha = jnp.ones((experts,), dtype=jnp.float32)
     norm_const = jnp.ones((1,), dtype=jnp.float32)
     result = grouped_gemm_swiglu_jax_sm100(
-        a_tensor=a,
+        a_tensor=a.reshape(rows, hidden),
         b_tensor=b,
         sfa_tensor=_compact_sf(sfa, _sf_atom_shape(1, rows, hidden), "sfa"),
         sfb_tensor=_compact_sf(sfb, _sf_atom_shape(experts, combined, hidden), "sfb"),
         padded_offsets=padded_offsets.astype(jnp.int32),
         alpha_tensor=alpha,
-        prob_tensor=prob.astype(jnp.float32),
+        prob_tensor=prob.reshape(rows).astype(jnp.float32),
         norm_const_tensor=norm_const,
         c_dtype=jnp.dtype(compute_dtype),
         d_dtype=jnp.dtype(output_dtype),
-        sf_vec_size=32,
-        discrete_col_sfd=True,
     )
     return (
         result["c_tensor"],
         result["d_tensor"],
         result["d_col_tensor"],
+        result["sfd_row_tensor"].reshape(-1),
+        result["sfd_col_tensor"].reshape(-1),
+    )
+
+
+def grouped_gemm_dswiglu(
+    a: jax.Array,
+    b: jax.Array,
+    c: jax.Array,
+    sfa: jax.Array,
+    sfb: jax.Array,
+    padded_offsets: jax.Array,
+    prob: jax.Array,
+    *,
+    output_dtype,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Run cuDNN's grouped MXFP8 GEMM + dSwiGLU + MXFP8 quantization API."""
+    if a.ndim != 2:
+        raise ValueError(f"Expected A[M,K], got {a.shape}")
+    if b.ndim != 3:
+        raise ValueError(f"Expected physical B[E,N,K], got {b.shape}")
+    if c.ndim != 2:
+        raise ValueError(f"Expected C[M,2N], got {c.shape}")
+
+    from cudnn import grouped_gemm_dswiglu_jax_sm100
+
+    rows, hidden = a.shape
+    experts, intermediate, b_hidden = b.shape
+    if hidden != b_hidden:
+        raise ValueError(f"A K={hidden} does not match B K={b_hidden}")
+    if c.shape != (rows, 2 * intermediate):
+        raise ValueError(f"Expected C shape {(rows, 2 * intermediate)}, got {c.shape}")
+
+    alpha = jnp.ones((experts,), dtype=jnp.float32)
+    beta = jnp.ones((experts,), dtype=jnp.float32)
+    norm_const = jnp.ones((1,), dtype=jnp.float32)
+    result = grouped_gemm_dswiglu_jax_sm100(
+        a_tensor=a,
+        b_tensor=b,
+        c_tensor=c,
+        sfa_tensor=_compact_sf(sfa, _sf_atom_shape(1, rows, hidden), "sfa"),
+        sfb_tensor=_compact_sf(
+            sfb, _sf_atom_shape(experts, intermediate, hidden), "sfb"
+        ),
+        padded_offsets=padded_offsets.astype(jnp.int32),
+        alpha_tensor=alpha,
+        beta_tensor=beta,
+        prob_tensor=prob.reshape(rows).astype(jnp.float32),
+        norm_const_tensor=norm_const,
+        d_dtype=jnp.dtype(output_dtype),
+    )
+    return (
+        result["d_row_tensor"],
+        result["d_col_tensor"],
+        result["dprob_tensor"],
         result["sfd_row_tensor"].reshape(-1),
         result["sfd_col_tensor"].reshape(-1),
     )
