@@ -119,6 +119,25 @@ Runtime Environment Variables
 
 These environment variables control the behavior of Transformer Engine during execution.
 
+General
+^^^^^^^
+
+.. envvar:: NVTE_TENSOR_HANDLE_POOL_SIZE_MB
+
+   :Type: ``int`` (positive integer)
+   :Default: ``20``
+   :Description: Size in MiB of the internal ``NVTETensor`` handle pool. Increase this
+                 value if an application legitimately creates more tensor handles than
+                 the default pool can hold.
+
+.. envvar:: NVTE_GROUPED_TENSOR_HANDLE_POOL_SIZE_MB
+
+   :Type: ``int`` (positive integer)
+   :Default: ``20``
+   :Description: Size in MiB of the internal ``NVTEGroupedTensor`` handle pool. Increase
+                 this value if an application legitimately creates more grouped tensor
+                 handles than the default pool can hold.
+
 Attention Backend Selection
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -343,7 +362,7 @@ Torch Compilation and Fusion
 
    :Type: ``int`` (0 or 1)
    :Default: ``1``
-   :Description: Enable PyTorch 2.x ``torch.compile`` support for compatible Transformer Engine operations. When set to ``0``, disables compilation support and uses regular PyTorch eager mode.
+   :Description: Enable Transformer Engine's internal ``torch.compile``-based kernel fusions (e.g. bias+GeLU, bias+dropout). When set to ``0``, these fusions run as separate eager operations. Does not affect compiling TE modules with ``torch.compile``.
 
 .. envvar:: NVTE_BIAS_GELU_NVFUSION
 
@@ -359,6 +378,16 @@ Torch Compilation and Fusion
 
 LayerNorm/RMSNorm SM Margins
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. envvar:: NVTE_CUDNN_MXFP8_NORM_OUTPUT_IN_INPUT_DTYPE
+
+   :Type: ``int`` (0 or 1)
+   :Default: ``0``
+   :Description: With cuDNN 9.25.0 or later, use the normalization input datatype for the virtual
+                 LayerNorm/RMSNorm output consumed by cuDNN MXFP8 block-scale quantization. This
+                 enables cuDNN's fused MXFP8 normalization engine, which requires matching FP16 or
+                 BF16 input and normalization-output datatypes. When set to ``0``, or with an
+                 earlier cuDNN version, the virtual normalization output uses FP32.
 
 .. envvar:: NVTE_FWD_LAYERNORM_SM_MARGIN
 
@@ -502,12 +531,12 @@ JAX-Specific Variables
 
    :Type: ``int`` (0 or 1)
    :Default: ``0``
-   :Description: **(JAX only)** Enable the experimental cuDNN frontend CuTeDSL fusion
-      for MXFP8 MoE FC1 grouped GEMM, SwiGLU/dSwiGLU, and grouped quantization.
-      Forward and backward launch as native TVM-FFI functions through ``jax-tvm-ffi``.
-      Explicit opt-in requires an eligible SM100 SwiGLU MXFP8 MoE call and the
-      optional compiler/runtime packages; unsupported calls warn with the full
-      validation reason list and use the unfused path.
+   :Description: **(JAX only)** Enable the experimental cuDNN frontend JAX fusion
+      for MXFP8 MoE FC1 grouped GEMM, SwiGLU, and grouped quantization. Forward
+      uses cuDNN's dedicated ``cudnn.jax.call`` API; backward uses TE's regular
+      MXFP8 grouped-GEMM path. Explicit opt-in requires an eligible SM100 SwiGLU
+      MXFP8 MoE call and cuDNN frontend with the grouped SwiGLU JAX entry point;
+      unsupported calls warn with the full validation reason list and fall back.
 
 JAX Triton Extensions
 ^^^^^^^^^^^^^^^^^^^^^

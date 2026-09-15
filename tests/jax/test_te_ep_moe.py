@@ -31,11 +31,12 @@ finiteness AND numerical parity vs a pure-JAX reference. Variations
 on the block are pytest parametrize values rather than separate test
 classes:
 
-* ``test_forward`` covers the forward across a curated set of
-  configurations (softmax/sigmoid scoring, optional non-zero
-  expert_bias). Each config asserts shape, dtype, finiteness and
-  numerical parity vs the reference in one run.
-* ``test_backward`` mirrors that for gradients.
+* ``test_forward`` covers BF16 and MXFP8 forward execution across a
+  curated set of configurations (softmax/sigmoid scoring, optional
+  non-zero expert_bias). Each config asserts shape, dtype, finiteness
+  and numerical parity vs the same BF16 reference in one run.
+* ``test_backward`` mirrors that for gradients. BF16 and MXFP8 share
+  the full test body and differ only in the grouped-GEMM quantizer sets.
 * ``TestTeEpMoeAuxLoss`` covers the second return value end-to-end
   (returned + parity + aux-only grad propagates to gate + combined
   main+aux grads stay finite) in two consolidated tests.
@@ -118,16 +119,16 @@ if get_device_compute_capability(0) < 100:
     )
 
 from transformer_engine.jax.flax import _MoEBlock as MoEBlock
-from transformer_engine.common.recipe import MXFP8BlockScaling
-from transformer_engine.jax import autocast
 from transformer_engine.jax.moe import (
     _ALIGN_SIZE,
-    _CUDNN_CUTEDSL_ALIGN_SIZE,
+    _CUDNN_JAX_ALIGN_SIZE,
     _use_cudnn_cutedsl_fusion_from_env,
+    get_moe_recv_capacity_per_rank,
     moe,
     record_ep_bootstrap_signature_for_moe,
 )
 from transformer_engine.jax.ep import ep_bootstrap
+from transformer_engine.common.recipe import MXFP8BlockScaling
 from transformer_engine.jax.sharding import MeshResource, global_shard_guard
 
 
@@ -148,80 +149,44 @@ LOGICAL_AXIS_RULES = (
     ("exp", EP_AXIS),
     ("embed", FSDP_AXIS),
     ("mlp", None),
-    ("batch", (EP_AXIS, FSDP_AXIS)),
+    ("batch", (FSDP_AXIS, EP_AXIS)),
 )
 
 # Small shapes so the parity tests stay tight on bf16. The block still
-# has all four ranks participating in dispatch/combine.  The explicit
-# MaxText-shape regression mode is selected by its dedicated test invocation;
-# keeping it opt-in avoids making every distributed parity test allocate the
-# production-slice buffers.
-_MAXTEXT_CUTEDSL_REGRESSION = os.getenv("TE_EP_MOE_MAXTEXT_CUTEDSL_REGRESSION", "0") == "1"
+# has all four ranks participating in dispatch/combine.
 DTYPE = jnp.bfloat16
-if _MAXTEXT_CUTEDSL_REGRESSION:
-    # Matches run-dsv3-prod-slice-ep2-fsdp2.sh: global batch 16, sequence
-    # length 4096, 32 experts, top-k 8, H=1792, expert MLP=2048.
-    BATCH = 16
-    SEQ = 4096
-    HIDDEN = 1792
-    INTER = 2048
-    NUM_EXPERTS = 32
-    TOPK = 8
-else:
-    BATCH = EP_SIZE * FSDP_SIZE * 2  # 8 on 4-GPU, 16 on 8-GPU
-    SEQ = 32
-    HIDDEN = 64
-    INTER = 128
-    NUM_EXPERTS = 8
-    TOPK = 2
+BATCH = EP_SIZE * FSDP_SIZE * 2  # 8 on 4-GPU, 16 on 8-GPU
+SEQ = 32
+HIDDEN = 128
+INTER = 128
+NUM_EXPERTS = 8
+TOPK = 2
 
-# bf16 grouped_gemm + softmax-topk + ep all-to-all stack drifts ~1e-1 vs a
-# fp32 numpy reference. Keep these tight enough to catch real bugs but
-# loose enough to absorb expected bf16 rounding.
-FWD_ATOL = 5e-2
-FWD_RTOL = 5e-2
-GRAD_FFN_ATOL = 1e-1
-GRAD_FFN_RTOL = 1e-1
-GRAD_GATE_ATOL = 5e-1
-GRAD_GATE_RTOL = 5e-1
-
-# Two TE EP runs that should be bitwise-equal modulo XLA fusion order
-# (slot alignment rounding, etc.).
-TE_TO_TE_ATOL = 5e-3
-TE_TO_TE_RTOL = 5e-3
+# MXFP8 grouped GEMMs have measurably more quantization drift than BF16.
+# These bounds are rounded slightly above the worst error observed across
+# the forward and backward configuration matrix.
+FWD_TOLERANCE = {
+    "bf16": {"atol": 5e-4, "rtol": 5e-4},
+    "mxfp8": {"atol": 7e-3, "rtol": 7e-3},
+}
+GRAD_FFN_TOLERANCE = {
+    "bf16": {"atol": 1e-7, "rtol": 1e-7},
+    "mxfp8": {"atol": 1.3e-6, "rtol": 1.3e-6},
+}
+GRAD_GATE_TOLERANCE = {
+    "bf16": {"atol": 7e-8, "rtol": 7e-8},
+    "mxfp8": {"atol": 8e-7, "rtol": 8e-7},
+}
 
 # Aux loss is computed in float32 from the SAME logits as the routing
 # path. Numerical drift between TE-EP and the reference is dominated by
 # the bf16-rounded softmax inside the topk kernel.
-AUX_ATOL = 1e-3
-AUX_RTOL = 1e-3
+AUX_TOLERANCE = {"atol": 1e-6, "rtol": 1e-6}
 
 
 # -----------------------------------------------------------------------------
 # Fixtures
 # -----------------------------------------------------------------------------
-
-
-def _compute_worst_case_recv_pr(alignment=_ALIGN_SIZE):
-    """Per-rank recv buffer the bootstrap must reserve.
-
-    NCCL EP HT expert-major uses one flat recv buffer with variable
-    per-expert zones. Each non-empty expert zone is padded to
-    ``_ALIGN_SIZE`` slots, so the reserve must cover the worst-case
-    total assignments plus independent per-zone padding.
-    """
-    num_procs = jax.device_count()
-    num_local_experts = NUM_EXPERTS // EP_SIZE
-    max_tokens_per_rank = (BATCH // num_procs) * SEQ
-    tokens_per_ep_group = EP_SIZE * max_tokens_per_rank
-    max_local_assignments = tokens_per_ep_group * min(TOPK, num_local_experts)
-    max_nonempty_experts = min(num_local_experts, max_local_assignments)
-    padded_total_bound = max_local_assignments + (alignment - 1) * max_nonempty_experts
-    aligned_total_bound = ((padded_total_bound + alignment - 1) // alignment) * alignment
-    per_expert_bound = (
-        num_local_experts * ((tokens_per_ep_group + alignment - 1) // alignment) * alignment
-    )
-    return min(per_expert_bound, aligned_total_bound)
 
 
 @pytest.fixture(scope="module")
@@ -239,9 +204,19 @@ def mesh():
 
     num_procs = jax.process_count()
     max_tokens_per_rank = (BATCH // num_procs) * SEQ
-    fusion_enabled = _use_cudnn_cutedsl_fusion_from_env()
-    alignment = _CUDNN_CUTEDSL_ALIGN_SIZE if fusion_enabled else _ALIGN_SIZE
-    recv_capacity_per_rank = _compute_worst_case_recv_pr(alignment)
+    # Worst-case recv capacity per rank
+    # TODO(jberchtold) support configurations other than worst-case by refactoring tests
+    # but if possible avoid bootstrap/teardown for each test
+    alignment = (
+        _CUDNN_JAX_ALIGN_SIZE if _use_cudnn_cutedsl_fusion_from_env() else _ALIGN_SIZE
+    )
+    recv_capacity_per_rank = get_moe_recv_capacity_per_rank(
+        num_experts=NUM_EXPERTS,
+        num_experts_per_tok=TOPK,
+        max_tokens_per_rank=max_tokens_per_rank,
+        ep_size=EP_SIZE,
+        alignment=alignment,
+    )
 
     # Eager bootstrap: ep_bootstrap does a host-side NCCL UID allgather
     # and cannot run from inside jax.jit. Sized to the worst-case recv_pr
@@ -299,8 +274,7 @@ def mesh():
 def _pure_jax_moe_reference(
     x,
     gate_kernel,
-    wi_0,
-    wi_1,
+    wi,
     wo,
     expert_bias=None,
     *,
@@ -341,6 +315,7 @@ def _pure_jax_moe_reference(
     # FFN. ``apply_topk_weights_early`` is a fusion knob that doesn't
     # change the math (wo is linear), so the reference is identical for
     # both placements.
+    wi_0, wi_1 = jnp.split(wi, 2, axis=-1)
     layer_w0 = jnp.einsum("th,ehm->tem", x_2d, wi_0)
     layer_w1 = jnp.einsum("th,ehm->tem", x_2d, wi_1)
     # Activation runs in x.dtype (typically bf16) to mirror the impl --
@@ -387,8 +362,9 @@ def _make_block(
     aux_loss_coeff=0.0,
     use_expert_routing_bias=False,
     score_function="softmax",
-    scaling_factor=1.0,
     expert_bias_init=None,
+    input_axes=("batch", None, None),
+    quantization_recipe=None,
 ):
     kwargs = dict(
         num_experts=NUM_EXPERTS,
@@ -399,8 +375,9 @@ def _make_block(
         aux_loss_coeff=aux_loss_coeff,
         use_expert_routing_bias=use_expert_routing_bias,
         score_function=score_function,
-        scaling_factor=scaling_factor,
         dtype=DTYPE,
+        input_axes=input_axes,
+        quantization_recipe=quantization_recipe,
     )
     # Custom expert_bias_init lets tests inject a non-zero expert_bias without
     # poking variables['params'] post-init.
@@ -455,12 +432,19 @@ def _init_apply(block, mesh, x, key):
         x_sh = _shard_inputs(x, mesh)
         variables = jax.jit(block.init)(key, x_sh)
         jax.block_until_ready(jax.tree_util.tree_leaves(variables)[0])
-        output, aux = jax.jit(block.apply)(variables, x_sh)
+        output, aux, _trt = jax.jit(block.apply)(variables, x_sh)
         jax.block_until_ready(output)
     return variables, output, aux
 
 
-def _grad_step(block, variables, mesh, x, *, include_aux=False):
+def _grad_step(
+    block,
+    variables,
+    mesh,
+    x,
+    *,
+    include_aux=False,
+):
     """Run jax.grad of mean(out^2) [+ aux if include_aux] vs (params, x).
 
     Returns ``(grads_variables, grad_x)`` so callers can check both the
@@ -471,7 +455,7 @@ def _grad_step(block, variables, mesh, x, *, include_aux=False):
         x_sh = _shard_inputs(x, mesh)
 
         def loss_fn(variables, x):
-            output, aux = block.apply(variables, x)
+            output, aux, _trt = block.apply(variables, x)
             loss = jnp.mean(output.astype(jnp.float32) ** 2)
             if include_aux and aux is not None:
                 loss = loss + aux.astype(jnp.float32)
@@ -490,7 +474,7 @@ def _grad_aux_only(block, variables, mesh, x):
         x_sh = _shard_inputs(x, mesh)
 
         def aux_only(variables, x):
-            _, aux = block.apply(variables, x)
+            _, aux, _trt = block.apply(variables, x)
             return aux.astype(jnp.float32)
 
         grads = jax.jit(jax.grad(aux_only))(variables, x_sh)
@@ -525,6 +509,13 @@ def _params_global_numpy(variables, mesh):
 def _make_inputs(key):
     """Generate a globally-identical input tensor on every process."""
     return jax.random.normal(key, (BATCH, SEQ, HIDDEN), dtype=DTYPE)
+
+
+def _quantization_recipe(quantization):
+    if quantization == "bf16":
+        return None
+    assert quantization == "mxfp8"
+    return MXFP8BlockScaling()
 
 
 # -----------------------------------------------------------------------------
@@ -570,6 +561,13 @@ _CONFIGS = [
     ),
 ]
 
+_QUANTIZATION_CASES = [
+    pytest.param("bf16", id="bf16"),
+]
+
+if get_device_compute_capability(0) >= 100:
+    _QUANTIZATION_CASES.append(pytest.param("mxfp8", id="mxfp8"))
+
 
 def _reference_kwargs_from_config(config, params_np):
     """Pick out the reference-relevant pieces of a parametrize config."""
@@ -588,8 +586,9 @@ class TestTeEpMoeForward:
     finiteness AND numerical parity vs the pure-JAX reference."""
 
     @pytest.mark.parametrize("config", _CONFIGS)
-    def test_forward(self, mesh, config):
-        block = _make_block(**config)
+    @pytest.mark.parametrize("quantization", _QUANTIZATION_CASES)
+    def test_forward(self, mesh, config, quantization):
+        block = _make_block(**config, quantization_recipe=_quantization_recipe(quantization))
         x = _make_inputs(jax.random.PRNGKey(0))
         variables, output, aux = _init_apply(block, mesh, x, jax.random.PRNGKey(1))
 
@@ -608,8 +607,7 @@ class TestTeEpMoeForward:
         out_ref, _ = _pure_jax_moe_reference(
             jnp.asarray(x_np),
             jnp.asarray(params_np["gate_kernel"]),
-            jnp.asarray(params_np["wi_0"]),
-            jnp.asarray(params_np["wi_1"]),
+            jnp.asarray(params_np["wi"]),
             jnp.asarray(params_np["wo"]),
             num_experts=NUM_EXPERTS,
             num_experts_per_tok=TOPK,
@@ -618,9 +616,8 @@ class TestTeEpMoeForward:
         np.testing.assert_allclose(
             out_te_np.astype(np.float32),
             np.asarray(jax.device_get(out_ref)).astype(np.float32),
-            atol=FWD_ATOL,
-            rtol=FWD_RTOL,
-            err_msg=f"forward parity breach for config={config}",
+            **FWD_TOLERANCE[quantization],
+            err_msg=f"forward parity breach for config={config}, quantization={quantization}",
         )
 
 
@@ -629,8 +626,9 @@ class TestTeEpMoeBackward:
     grads finite, non-zero AND parity vs the pure-JAX reference."""
 
     @pytest.mark.parametrize("config", _CONFIGS)
-    def test_backward(self, mesh, config):
-        block = _make_block(**config)
+    @pytest.mark.parametrize("quantization", _QUANTIZATION_CASES)
+    def test_backward(self, mesh, config, quantization):
+        block = _make_block(**config, quantization_recipe=_quantization_recipe(quantization))
         x = _make_inputs(jax.random.PRNGKey(2))
         variables, _, _ = _init_apply(block, mesh, x, jax.random.PRNGKey(3))
         grads_te, grad_x_te = _grad_step(block, variables, mesh, x)
@@ -647,8 +645,7 @@ class TestTeEpMoeBackward:
             out, _ = _pure_jax_moe_reference(
                 x,
                 params["gate_kernel"],
-                params["wi_0"],
-                params["wi_1"],
+                params["wi"],
                 params["wo"],
                 ref_expert_bias,
                 num_experts=NUM_EXPERTS,
@@ -664,22 +661,19 @@ class TestTeEpMoeBackward:
         grads_ref_np = {k: np.asarray(jax.device_get(v)) for k, v in grads_ref.items()}
         grad_x_ref_np = np.asarray(jax.device_get(grad_x_ref))
 
-        for name in ("gate_kernel", "wi_0", "wi_1", "wo"):
+        for name in ("gate_kernel", "wi", "wo"):
             # Per-tensor: finite + non-zero + parity in one pass.
             g_te = _to_global_numpy(_unwrap(grads_te["params"][name]), mesh)
             assert np.all(np.isfinite(g_te)), f"{name} grad has NaN/Inf [config={config}]"
             assert np.any(g_te != 0.0), f"{name} grad identically zero [config={config}]"
-            atol, rtol = (
-                (GRAD_GATE_ATOL, GRAD_GATE_RTOL)
-                if name == "gate_kernel"
-                else (GRAD_FFN_ATOL, GRAD_FFN_RTOL)
-            )
+            tolerances = GRAD_GATE_TOLERANCE if name == "gate_kernel" else GRAD_FFN_TOLERANCE
             np.testing.assert_allclose(
                 g_te.astype(np.float32),
                 grads_ref_np[name].astype(np.float32),
-                atol=atol,
-                rtol=rtol,
-                err_msg=f"grad parity breach on {name} [config={config}]",
+                **tolerances[quantization],
+                err_msg=(
+                    f"grad parity breach on {name} [config={config}, quantization={quantization}]"
+                ),
             )
 
         # d_x: the gradient propagated back to the previous layer. Checks
@@ -699,215 +693,40 @@ class TestTeEpMoeBackward:
         np.testing.assert_allclose(
             grad_x_te_np.astype(np.float32),
             grad_x_ref_np.astype(np.float32),
-            atol=GRAD_FFN_ATOL,
-            rtol=GRAD_FFN_RTOL,
-            err_msg=f"d_x parity breach [config={config}]",
+            **GRAD_FFN_TOLERANCE[quantization],
+            err_msg=f"d_x parity breach [config={config}, quantization={quantization}]",
         )
 
 
 class TestTeEpMoeCudnnCutedslFusion:
-    """End-to-end MXFP8 coverage for the opt-in FC1+SwiGLU+quant fusion."""
+    """End-to-end MXFP8 coverage for cuDNN's dedicated grouped SwiGLU JAX API."""
 
     @pytest.mark.parametrize("apply_topk_weights_early", [False, True])
     def test_mxfp8_forward_and_backward(self, mesh, apply_topk_weights_early):
         if not _use_cudnn_cutedsl_fusion_from_env():
             pytest.skip("run separately with NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION=1")
-        block = _make_block(apply_topk_weights_early=apply_topk_weights_early)
+        block = _make_block(
+            apply_topk_weights_early=apply_topk_weights_early,
+            quantization_recipe=MXFP8BlockScaling(),
+        )
         x = _make_inputs(jax.random.PRNGKey(30))
-        mesh_resource = MeshResource(ep_resource=EP_AXIS, fsdp_resource=FSDP_AXIS)
+        variables, output, aux = _init_apply(block, mesh, x, jax.random.PRNGKey(31))
+        grads, grad_x = _grad_step(block, variables, mesh, x)
 
-        with _ctx(mesh), autocast(
-            enabled=True,
-            recipe=MXFP8BlockScaling(),
-            mesh_resource=mesh_resource,
-        ):
-            x_sh = _shard_inputs(x, mesh)
-            variables = jax.jit(block.init)(jax.random.PRNGKey(31), x_sh)
-            fused, _ = jax.jit(block.apply)(variables, x_sh)
+        assert output.shape == x.shape
+        assert output.dtype == x.dtype
+        assert aux is None
+        output_np = _to_global_numpy(output, mesh).astype(np.float32)
+        assert np.all(np.isfinite(output_np))
+        assert np.any(output_np != 0)
 
-            def loss_fn(vars_arg, x_arg):
-                output, _ = block.apply(vars_arg, x_arg)
-                return jnp.mean(output.astype(jnp.float32) ** 2)
-
-            grads, grad_x = jax.jit(jax.grad(loss_fn, argnums=(0, 1)))(variables, x_sh)
-            jax.block_until_ready((fused, grads, grad_x))
-
-        # Do not compile the unfused EP path in this CuTeDSL process. The C++
-        # backend caches the first layer alignment process-wide, so a
-        # 256-aligned fused run and a 128-aligned unfused run must live in
-        # separate Python process groups. run_te_ep_moe.sh covers the unfused
-        # CUDA C++ path in its ordinary phase.
-        fused_np = _to_global_numpy(fused, mesh).astype(np.float32)
-        assert np.all(np.isfinite(fused_np))
-
-        params_np = _params_global_numpy(variables, mesh)
-        # MoEBlock callers provide ordinary routing decisions, not the
-        # CuTeDSL kernel's 256-padded expert boundaries. Verify this seeded
-        # case is genuinely ragged before the internal dispatch/padding path.
-        routing_logits = jnp.asarray(jax.device_get(x)).reshape(-1, HIDDEN) @ jnp.asarray(
-            params_np["gate_kernel"]
-        ).astype(DTYPE)
-        _, routed_experts = jax.lax.top_k(routing_logits.astype(jnp.float32), k=TOPK)
-        raw_routing_counts = np.asarray(
-            jax.device_get(jnp.bincount(routed_experts.reshape(-1), length=NUM_EXPERTS))
-        )
-        assert np.unique(raw_routing_counts).size > 1, (
-            f"expected unequal raw routing counts, got {raw_routing_counts}"
-        )
-        assert np.any(raw_routing_counts % _CUDNN_CUTEDSL_ALIGN_SIZE != 0), (
-            "MoEBlock regression must exercise unaligned caller-visible routing counts; "
-            f"got {raw_routing_counts}"
-        )
-        reference, _ = _pure_jax_moe_reference(
-            jnp.asarray(jax.device_get(x)),
-            jnp.asarray(params_np["gate_kernel"]),
-            jnp.asarray(params_np["wi_0"]),
-            jnp.asarray(params_np["wi_1"]),
-            jnp.asarray(params_np["wo"]),
-            num_experts=NUM_EXPERTS,
-            num_experts_per_tok=TOPK,
-        )
-        reference_np = np.asarray(jax.device_get(reference), dtype=np.float32)
-        relative_error = np.linalg.norm(fused_np - reference_np) / np.linalg.norm(reference_np)
-        assert relative_error < 0.2
-
-        for name in ("gate_kernel", "wi_0", "wi_1", "wo"):
+        for name in ("gate_kernel", "wi", "wo"):
             grad = _to_global_numpy(_unwrap(grads["params"][name]), mesh).astype(np.float32)
             assert np.all(np.isfinite(grad)), f"{name} fused MXFP8 grad has NaN/Inf"
             assert np.any(grad != 0), f"{name} fused MXFP8 grad is identically zero"
         grad_x_np = _to_global_numpy(grad_x, mesh).astype(np.float32)
         assert np.all(np.isfinite(grad_x_np))
         assert np.any(grad_x_np != 0)
-
-        # A finite gradient is not sufficient: a layout error can produce a
-        # finite but numerically invalid VJP that corrupts parameters on the
-        # first optimizer update. Compare all learnable gradients to the same
-        # pure-JAX reference used by the non-quantized VJP tests.
-        def reference_loss(params, x_arg):
-            output, _ = _pure_jax_moe_reference(
-                x_arg,
-                params["gate_kernel"],
-                params["wi_0"],
-                params["wi_1"],
-                params["wo"],
-                num_experts=NUM_EXPERTS,
-                num_experts_per_tok=TOPK,
-            )
-            return jnp.mean(output.astype(jnp.float32) ** 2)
-
-        reference_params = {
-            name: jnp.asarray(params_np[name]) for name in ("gate_kernel", "wi_0", "wi_1", "wo")
-        }
-        reference_grads = jax.jit(jax.grad(reference_loss))(
-            reference_params, jnp.asarray(jax.device_get(x))
-        )
-        for name, reference_grad in reference_grads.items():
-            fused_grad = _to_global_numpy(_unwrap(grads["params"][name]), mesh).astype(np.float32)
-            reference_grad = np.asarray(jax.device_get(reference_grad), dtype=np.float32)
-            relative_error = np.linalg.norm(fused_grad - reference_grad) / max(
-                np.linalg.norm(reference_grad), 1e-12
-            )
-            assert (
-                relative_error < 0.35
-            ), f"{name} fused MXFP8 VJP relative error {relative_error:.4f} exceeds 0.35"
-
-        # Exercise the failure mode seen in MaxText over several optimizer-like
-        # steps. A one-step check can miss ABI/layout corruption that appears
-        # only after the newly quantized weights feed the next backward pass.
-        training_variables = variables
-        losses = []
-        with _ctx(mesh), autocast(
-            enabled=True,
-            recipe=MXFP8BlockScaling(),
-            mesh_resource=mesh_resource,
-        ):
-            compiled_loss_and_grad = jax.jit(jax.value_and_grad(loss_fn))
-            for _ in range(3):
-                step_loss, step_grads = compiled_loss_and_grad(training_variables, x_sh)
-                training_variables = jax.tree_util.tree_map(
-                    lambda param, grad: param
-                    - jnp.asarray(1e-3, param.dtype) * grad.astype(param.dtype),
-                    training_variables,
-                    step_grads,
-                )
-                losses.append(step_loss)
-            updated_output, _ = jax.jit(block.apply)(training_variables, _shard_inputs(x, mesh))
-            updated_output.block_until_ready()
-            jax.block_until_ready(losses)
-        updated_output_np = _to_global_numpy(updated_output, mesh).astype(np.float32)
-        loss_values = np.asarray([jax.device_get(loss) for loss in losses], dtype=np.float32)
-        assert np.all(np.isfinite(loss_values)), f"training losses have NaN/Inf: {loss_values}"
-        assert loss_values[-1] <= 1.2 * loss_values[0], f"training loss diverged: {loss_values}"
-        assert np.all(np.isfinite(updated_output_np)), "post-training output has NaN/Inf"
-
-    def test_maxtext_shape_vjp_update_stays_finite(self, mesh):
-        """Regression for the NaN observed after MaxText's first update."""
-        if not _use_cudnn_cutedsl_fusion_from_env():
-            pytest.skip("run separately with NVTE_JAX_MOE_USE_CUDNN_CUTEDSL_FUSION=1")
-        if not _MAXTEXT_CUTEDSL_REGRESSION:
-            pytest.skip("set TE_EP_MOE_MAXTEXT_CUTEDSL_REGRESSION=1 for the large regression")
-
-        block = _make_block(
-            score_function="sigmoid",
-            use_expert_routing_bias=True,
-            scaling_factor=2.5,
-        )
-        x = _make_inputs(jax.random.PRNGKey(40))
-        mesh_resource = MeshResource(ep_resource=EP_AXIS, fsdp_resource=FSDP_AXIS)
-        with _ctx(mesh), autocast(
-            enabled=True,
-            recipe=MXFP8BlockScaling(),
-            mesh_resource=mesh_resource,
-        ):
-            x_sh = _shard_inputs(x, mesh)
-            variables = jax.jit(block.init)(jax.random.PRNGKey(41), x_sh)
-
-            compiled_forward = jax.jit(block.apply)
-            forward_0, _ = compiled_forward(variables, x_sh)
-            forward_1, _ = compiled_forward(variables, x_sh)
-            jax.block_until_ready((forward_0, forward_1))
-            forward_0_local = np.asarray(jax.device_get(forward_0.addressable_data(0)))
-            forward_1_local = np.asarray(jax.device_get(forward_1.addressable_data(0)))
-            assert np.all(np.isfinite(forward_0_local)), "first repeated forward has NaN/Inf"
-            assert np.all(np.isfinite(forward_1_local)), "second repeated forward has NaN/Inf"
-
-            def loss_fn(vars_arg, x_arg):
-                output, _ = block.apply(vars_arg, x_arg)
-                return jnp.mean(output.astype(jnp.float32) ** 2)
-
-            def train_step(vars_arg, x_arg, learning_rate):
-                loss, grads = jax.value_and_grad(loss_fn)(vars_arg, x_arg)
-                updated_vars = jax.tree_util.tree_map(
-                    lambda param, grad: param
-                    - learning_rate.astype(param.dtype) * grad.astype(param.dtype),
-                    vars_arg,
-                    grads,
-                )
-                return updated_vars, loss, grads
-
-            compiled_train_step = jax.jit(train_step)
-            # MaxText's two-step warmup uses LR=0 at step 0. The second
-            # invocation therefore checks that replaying the same compiled
-            # kernel/VJP is safe even before any parameter value changes.
-            variables, loss_0, grads = compiled_train_step(
-                variables, x_sh, jnp.asarray(0.0, jnp.float32)
-            )
-            jax.block_until_ready((loss_0, grads))
-            assert np.isfinite(float(loss_0.addressable_data(0))), "step-0 loss has NaN/Inf"
-            for path, grad in jax.tree_util.tree_leaves_with_path(grads):
-                grad_local = np.asarray(jax.device_get(_unwrap(grad).addressable_data(0)))
-                assert np.all(np.isfinite(grad_local)), f"gradient {path} has NaN/Inf"
-            variables, loss_1, _ = compiled_train_step(
-                variables, x_sh, jnp.asarray(1.5e-5, jnp.float32)
-            )
-            jax.block_until_ready(loss_1)
-            assert np.isfinite(float(loss_1.addressable_data(0))), "step-1 loss has NaN/Inf"
-
-            updated_output, _ = jax.jit(block.apply)(variables, x_sh)
-            updated_output.block_until_ready()
-
-        updated_local = np.asarray(jax.device_get(updated_output.addressable_data(0)))
-        assert np.all(np.isfinite(updated_local)), "MaxText-shape post-update output has NaN/Inf"
 
 
 class TestTeEpMoeAuxLoss:
@@ -939,8 +758,7 @@ class TestTeEpMoeAuxLoss:
         _, aux_ref = _pure_jax_moe_reference(
             jnp.asarray(x_np),
             jnp.asarray(params_np["gate_kernel"]),
-            jnp.asarray(params_np["wi_0"]),
-            jnp.asarray(params_np["wi_1"]),
+            jnp.asarray(params_np["wi"]),
             jnp.asarray(params_np["wo"]),
             num_experts=NUM_EXPERTS,
             num_experts_per_tok=TOPK,
@@ -949,8 +767,7 @@ class TestTeEpMoeAuxLoss:
         np.testing.assert_allclose(
             float(aux_np),
             float(jax.device_get(aux_ref)),
-            atol=AUX_ATOL,
-            rtol=AUX_RTOL,
+            **AUX_TOLERANCE,
         )
 
         # Aux-only bwd must propagate to gate_kernel — proves the
@@ -970,7 +787,7 @@ class TestTeEpMoeAuxLoss:
         x = _make_inputs(jax.random.PRNGKey(22))
         variables, _, _ = _init_apply(block, mesh, x, jax.random.PRNGKey(23))
         grads, _ = _grad_step(block, variables, mesh, x, include_aux=True)
-        for name in ("gate_kernel", "wi_0", "wi_1", "wo"):
+        for name in ("gate_kernel", "wi", "wo"):
             g_local = np.asarray(jax.device_get(_unwrap(grads["params"][name]).addressable_data(0)))
             assert np.all(np.isfinite(g_local)), f"{name} grad NaN/Inf under main+aux"
             assert np.any(g_local != 0.0), f"{name} grad zero under main+aux"

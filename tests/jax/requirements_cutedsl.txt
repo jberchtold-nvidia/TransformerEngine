@@ -1,8 +1,6 @@
-# Known-good baseline for the JAX CuTeDSL MoE pipeclean.
+# Dependencies for the cuDNN JAX grouped-SwiGLU MoE path.
 jax[cuda13]>=0.9.1
-nvidia-cutlass-dsl[cu13]==4.5.2
-apache-tvm-ffi>=0.1.12
-jax-tvm-ffi>=0.1.3
+nvidia-cutlass-dsl[cu13]>=4.6.2
 
-# Install the sibling cuDNN-FE fork separately with its torch-free compiler extra:
-#   pip install -e "../cudnn-frontend[cutedsl-compile]"
+# Install the sibling cuDNN-FE checkout separately:
+#   pip install ../cudnn-frontend

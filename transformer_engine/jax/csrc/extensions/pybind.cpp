@@ -159,8 +159,8 @@ PYBIND11_MODULE(transformer_engine_jax, m) {
   m.def("set_ep_bootstrap_params", &SetEpBootstrapParams, pybind11::arg("unique_id_bytes"),
         pybind11::arg("ep_size"), pybind11::arg("rank_within_group"), pybind11::arg("num_experts"),
         pybind11::arg("max_tokens_per_rank"), pybind11::arg("max_recv_tokens_per_rank"),
-        pybind11::arg("hidden_dim"), pybind11::arg("max_num_sms"),
-        pybind11::arg("max_token_dtype"));
+        pybind11::arg("hidden_dim"), pybind11::arg("max_num_sms"), pybind11::arg("max_token_dtype"),
+        pybind11::arg("drop_on_overflow"));
   m.def("release_ep_resources", &ReleaseEpResources);
   m.def("ep_handle_mem_size", &EpHandleMemSize, pybind11::arg("top_k"),
         pybind11::arg("dispatch_output_per_expert_alignment") = 0);
@@ -255,6 +255,7 @@ PYBIND11_MODULE(transformer_engine_jax, m) {
   pybind11::enum_<JAXX_Score_Function>(m, "JAXX_Score_Function", pybind11::module_local())
       .value("SIGMOID", JAXX_Score_Function::SIGMOID)
       .value("SOFTMAX", JAXX_Score_Function::SOFTMAX)
+      .value("SQRTSOFTPLUS", JAXX_Score_Function::SQRTSOFTPLUS)
       .export_values();
 
   pybind11::enum_<JAXX_Routing_Map_Format>(m, "JAXX_Routing_Map_Format", pybind11::module_local())
