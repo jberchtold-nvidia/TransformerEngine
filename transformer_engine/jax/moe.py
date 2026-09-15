@@ -150,15 +150,22 @@ def get_moe_recv_capacity_per_rank(
     max_tokens_per_rank: int,
     ep_size: int,
     recv_capacity_factor: Optional[float] = None,
-    alignment: int = _ALIGN_SIZE,
+    alignment: Optional[int] = None,
 ) -> int:
     """Return the aligned receive capacity for one EP rank.
 
     ``recv_capacity_factor=None`` reserves the dropless worst case. A finite
     factor >= 1 scales the capacity needed by perfectly balanced routing and
     is capped at the worst case. The balanced baseline includes the independent
-    per-local-expert alignment required by NCCL EP.
+    per-local-expert alignment required by NCCL EP. When ``alignment`` is not
+    supplied, it follows the active MoE implementation: 256 for the cuDNN
+    grouped-SwiGLU fusion and 128 for the regular TE grouped GEMM. This keeps
+    eager bootstrap callers in sync with the later compiled ``moe()`` call.
     """
+    if alignment is None:
+        alignment = (
+            _CUDNN_JAX_ALIGN_SIZE if _use_cudnn_cutedsl_fusion_from_env() else _ALIGN_SIZE
+        )
     if num_experts <= 0 or num_experts_per_tok <= 0 or max_tokens_per_rank <= 0:
         raise ValueError(
             "num_experts, num_experts_per_tok, and max_tokens_per_rank must be positive"
