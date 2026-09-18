@@ -101,9 +101,17 @@ def _cudnn_jax_fusion_rejection_reasons(
         errors.append("requires activation_type='silu'")
     if wi_0_bias is not None or wi_1_bias is not None:
         errors.append("does not support FC1 gate/up bias")
-    if wi.ndim != 3 or wi.shape[-1] % 64:
+    hidden = x.shape[-1]
+    standard_layout = (
+        wi.ndim == 3 and wi.shape[-2] == hidden and wi.shape[-1] % 64 == 0
+    )
+    native_layout = (
+        wi.ndim == 3 and wi.shape[-1] == hidden and wi.shape[-2] % 64 == 0
+    )
+    if not standard_layout and not native_layout:
         errors.append(
-            f"requires rank-3 wi with a 64-aligned gated dimension, got {wi.shape}"
+            "requires rank-3 wi in standard [E,K,2N] or cuDNN-native [E,2N,K] "
+            f"layout with a 64-aligned gated dimension and K={hidden}, got {wi.shape}"
         )
     if x.dtype not in (jnp.bfloat16, jnp.float16):
         errors.append(f"requires BF16 or FP16 activations, got {x.dtype}")
@@ -469,6 +477,7 @@ def _ffn_fwd_per_shard(
     activation_type: str,
     apply_topk_weights_early: bool,
     use_cudnn_jax_fusion: bool,
+    cudnn_native_weight_layout: bool,
 ):
     """Run the grouped FFN on one shard's EP receive buffer."""
     hidden = recv_tokens_local.shape[-1]
@@ -479,13 +488,22 @@ def _ffn_fwd_per_shard(
     wi = wi.astype(sorted_x.dtype)
     wo = wo.astype(sorted_x.dtype)
 
-    # TE stores wi as [gate, up]. cuDNN consumes alternating 32-column
-    # gate/up blocks, while the regular grouped GEMM consumes TE's layout.
+    # The cuDNN-native parameter is persistent [E,2N,K] storage with alternating
+    # 32-column gate/up blocks. Standard TE storage is [E,K,2N] with contiguous
+    # gate/up halves. Keep conversion only as a compatibility fallback.
     if use_cudnn_jax_fusion:
-        wi_gate, wi_up = jnp.split(wi, 2, axis=-1)
-        wi_for_gemm = tex.pack_swiglu_pair(wi_gate, wi_up)
+        if cudnn_native_weight_layout:
+            wi_for_gemm = wi
+        else:
+            wi_gate, wi_up = jnp.split(wi, 2, axis=-1)
+            wi_for_gemm = tex.pack_swiglu_pair(wi_gate, wi_up)
     else:
-        wi_for_gemm = wi
+        if cudnn_native_weight_layout:
+            wi_interleaved = wi.transpose(0, 2, 1)
+            wi_gate, wi_up = tex.unpack_swiglu_pair(wi_interleaved)
+            wi_for_gemm = jnp.concatenate((wi_gate, wi_up), axis=-1)
+        else:
+            wi_for_gemm = wi
     wi_combined_bias = (
         jnp.concatenate([wi_0_bias, wi_1_bias], axis=-1)
         if wi_0_bias is not None
@@ -505,7 +523,14 @@ def _ffn_fwd_per_shard(
     casted_intermediate = None
     if use_cudnn_jax_fusion:
         casted_sorted_x_lhs = casted_sorted_x.get_tensor(usage=TensorUsage.LHS)
-        casted_wi_rhs = casted_wi.get_tensor(usage=TensorUsage.RHS)
+        casted_wi_rhs = casted_wi.get_tensor(
+            usage=TensorUsage.LHS if cudnn_native_weight_layout else TensorUsage.RHS
+        )
+        combined = (
+            wi_for_gemm.shape[-2]
+            if cudnn_native_weight_layout
+            else wi_for_gemm.shape[-1]
+        )
         padded_offsets = jnp.cumsum(group_sizes, dtype=jnp.int32)
         prob = (
             recv_w_flat[:, None, None]
@@ -520,9 +545,13 @@ def _ffn_fwd_per_shard(
             intermediate_scale_col,
         ) = tex.grouped_gemm_swiglu(
             casted_sorted_x_lhs.data.reshape(sorted_x.shape[0], hidden, 1),
-            casted_wi_rhs.data.reshape(
-                num_local_experts, hidden, wi_for_gemm.shape[-1]
-            ).transpose(0, 2, 1),
+            (
+                casted_wi_rhs.data.reshape(num_local_experts, combined, hidden)
+                if cudnn_native_weight_layout
+                else casted_wi_rhs.data.reshape(
+                    num_local_experts, hidden, combined
+                ).transpose(0, 2, 1)
+            ),
             casted_sorted_x_lhs.scale_inv,
             casted_wi_rhs.scale_inv,
             padded_offsets,
@@ -530,10 +559,12 @@ def _ffn_fwd_per_shard(
             compute_dtype=sorted_x.dtype,
             output_dtype=fc2_quantizer_set.x.q_dtype,
         )
-        combined_out = combined_out_3d.reshape(sorted_x.shape[0], wi_for_gemm.shape[-1])
-        gate_proj_out, up_proj_out = tex.unpack_swiglu_pair(combined_out)
+        combined_out = combined_out_3d.reshape(sorted_x.shape[0], combined)
+        # The fused backward consumes interleaved C directly. Keep both residual
+        # slots as aliases instead of materializing an otherwise-unused unpack.
+        gate_proj_out = up_proj_out = combined_out
 
-        intermediate_shape = (sorted_x.shape[0], gate_proj_out.shape[-1])
+        intermediate_shape = (sorted_x.shape[0], combined // 2)
         scaling_mode = fc2_quantizer_set.x.scaling_mode
         row_scale_size = scaling_mode.get_grouped_scale_shape(
             intermediate_shape,
@@ -617,7 +648,13 @@ def _ffn_fwd_per_shard(
         casted_sorted_x.get_tensor(usage=TensorUsage.LHS_TRANS).checkpoint(
             fc1_quantizer_set.x
         ),
-        casted_wi.get_tensor(usage=TensorUsage.RHS_TRANS).checkpoint(
+        casted_wi.get_tensor(
+            usage=(
+                TensorUsage.LHS
+                if use_cudnn_jax_fusion and cudnn_native_weight_layout
+                else TensorUsage.RHS_TRANS
+            )
+        ).checkpoint(
             fc1_quantizer_set.kernel
         ),
         combined_out if use_cudnn_jax_fusion else gate_proj_out,
@@ -649,6 +686,7 @@ def _ffn_bwd_per_shard(
     apply_topk_weights_early: bool,
     has_bias: bool,
     use_cudnn_jax_fusion: bool,
+    cudnn_native_weight_layout: bool,
 ):
     """Backward mirror of :func:`_ffn_fwd_per_shard`."""
     group_sizes = local_group_sizes.reshape(-1).astype(jnp.int32)
@@ -780,16 +818,28 @@ def _ffn_bwd_per_shard(
     d_sorted_x = tex.grouped_gemm(
         casted_d_combined.get_tensor(usage=TensorUsage.LHS),
         casted_wi_rhs_trans,
-        contracting_dims=((1,), (2,)),
+        contracting_dims=((1,), (1 if cudnn_native_weight_layout else 2,)),
     )
-    d_wi_combined = tex.grouped_gemm(
-        casted_sorted_x_lhs_trans,
-        casted_d_combined.get_tensor(usage=TensorUsage.RHS),
-        contracting_dims=((0,), (0,)),
-    )
-    if use_cudnn_jax_fusion:
+    if cudnn_native_weight_layout:
+        # dY^T @ X directly produces [E,2N,K], matching the persistent native
+        # parameter, without a post-GEMM transpose or de-interleave/repack.
+        d_wi_combined = tex.grouped_gemm(
+            casted_d_combined.get_tensor(usage=TensorUsage.LHS_TRANS),
+            casted_sorted_x_lhs_trans,
+            contracting_dims=((0,), (0,)),
+        )
+    else:
+        d_wi_combined = tex.grouped_gemm(
+            casted_sorted_x_lhs_trans,
+            casted_d_combined.get_tensor(usage=TensorUsage.RHS),
+            contracting_dims=((0,), (0,)),
+        )
+    if use_cudnn_jax_fusion and not cudnn_native_weight_layout:
         d_wi_gate, d_wi_up = tex.unpack_swiglu_pair(d_wi_combined)
         d_wi_combined = jnp.concatenate([d_wi_gate, d_wi_up], axis=-1)
+    elif not use_cudnn_jax_fusion and cudnn_native_weight_layout:
+        d_wi_gate, d_wi_up = jnp.split(d_wi_combined, 2, axis=-1)
+        d_wi_combined = tex.pack_swiglu_pair(d_wi_gate, d_wi_up).transpose(0, 2, 1)
     if has_bias:
         d_wi_combined_bias = tex.grouped_dbias(d_combined_for_bias, group_sizes)
         d_wi_0_bias, d_wi_1_bias = jnp.split(d_wi_combined_bias, 2, axis=-1)
@@ -879,6 +929,7 @@ def _moe_fwd_rule(
 
     B, S, H = x.shape
     K = num_experts_per_tok
+    cudnn_native_weight_layout = wi.ndim == 3 and wi.shape[-1] == H
     if B % num_procs != 0:
         raise ValueError(f"batch={B} not divisible by ep*dp={num_procs}")
 
@@ -1089,6 +1140,7 @@ def _moe_fwd_rule(
             activation_type=activation_type,
             apply_topk_weights_early=apply_topk_weights_early,
             use_cudnn_jax_fusion=use_cudnn_jax_fusion,
+            cudnn_native_weight_layout=cudnn_native_weight_layout,
         )
 
     expert_outputs, ffn_residuals = shard_map(
@@ -1165,6 +1217,7 @@ def _moe_fwd_rule(
         "has_bias": has_bias,
         "x_shape": x.shape,
         "recv_pr": recv_pr,
+        "cudnn_native_weight_layout": cudnn_native_weight_layout,
     }
     # total_recv_tokens is a non-differentiable overflow signal (see moe()).
     return (output, aux_loss, total_recv_tokens), (ctx, static)
@@ -1278,6 +1331,7 @@ def _moe_bwd_rule(
             apply_topk_weights_early=apply_topk_weights_early,
             has_bias=has_bias,
             use_cudnn_jax_fusion=use_cudnn_jax_fusion,
+            cudnn_native_weight_layout=static["cudnn_native_weight_layout"],
         )
         (
             d_sorted_x_local,
