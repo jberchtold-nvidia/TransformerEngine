@@ -73,9 +73,9 @@ def grouped_gemm_swiglu_dependencies_available() -> tuple[bool, str]:
     """Check the public cuDNN JAX API without compiling a kernel."""
     try:
         import cutlass.jax
-        from cudnn import (  # noqa: F401
-            grouped_gemm_dswiglu_jax_sm100,
-            grouped_gemm_swiglu_jax_sm100,
+        from cudnn.jax import (  # noqa: F401
+            grouped_gemm_dswiglu,
+            grouped_gemm_swiglu,
         )
 
         if not cutlass.jax.is_available():
@@ -107,7 +107,7 @@ def grouped_gemm_swiglu(
     if b.ndim != 3:
         raise ValueError(f"Expected physical B[E,N,K], got {b.shape}")
 
-    from cudnn import grouped_gemm_swiglu_jax_sm100
+    from cudnn.jax import grouped_gemm_swiglu as cudnn_grouped_gemm_swiglu
 
     rows, hidden, _ = a.shape
     experts, combined, b_hidden = b.shape
@@ -115,7 +115,7 @@ def grouped_gemm_swiglu(
         raise ValueError(f"A K={hidden} does not match B K={b_hidden}")
     alpha = jnp.ones((experts,), dtype=jnp.float32)
     norm_const = jnp.ones((1,), dtype=jnp.float32)
-    result = grouped_gemm_swiglu_jax_sm100(
+    result = cudnn_grouped_gemm_swiglu(
         a_tensor=a.reshape(rows, hidden),
         b_tensor=b,
         sfa_tensor=_compact_sf(sfa, _sf_atom_shape(1, rows, hidden), "sfa"),
@@ -155,7 +155,7 @@ def grouped_gemm_dswiglu(
     if c.ndim != 2:
         raise ValueError(f"Expected C[M,2N], got {c.shape}")
 
-    from cudnn import grouped_gemm_dswiglu_jax_sm100
+    from cudnn.jax import grouped_gemm_dswiglu as cudnn_grouped_gemm_dswiglu
 
     rows, hidden = a.shape
     experts, intermediate, b_hidden = b.shape
@@ -167,7 +167,7 @@ def grouped_gemm_dswiglu(
     alpha = jnp.ones((experts,), dtype=jnp.float32)
     beta = jnp.ones((experts,), dtype=jnp.float32)
     norm_const = jnp.ones((1,), dtype=jnp.float32)
-    result = grouped_gemm_dswiglu_jax_sm100(
+    result = cudnn_grouped_gemm_dswiglu(
         a_tensor=a,
         b_tensor=b,
         c_tensor=c,
