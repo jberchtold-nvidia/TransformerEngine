@@ -95,8 +95,8 @@ def _cudnn_jax_fusion_rejection_reasons(
     except RuntimeError as exc:
         errors.append(f"could not query GPU compute capability: {exc}")
     else:
-        if compute_capability != 100:
-            errors.append(f"requires an SM100 GPU, got SM{compute_capability}")
+        if compute_capability < 100:
+            errors.append(f"requires an SM100+ GPU, got SM{compute_capability}")
     if str(activation_type).lower() != "silu":
         errors.append("requires activation_type='silu'")
     if wi_0_bias is not None or wi_1_bias is not None:
